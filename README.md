@@ -2,9 +2,7 @@
 
 **A friendlier language for friendlier times.**
 
-> **Interpretor 294/294, lang/AOT tests 121/121, Performance tests 8/8, Full AOT Suite 171/289 -> I know it's not the most useful information, pardon me, it's just internal. Eh.**
-
-SageTree is a new, very new, experimental programming language. It was originally created by one person (Night-Traders-Dev as SageLang), picked up and heavily modified by another (MilkmanAbi), and is currently maintained by a single developer. Progress is slow. That is the honest reality, and we think that is okay. **Credits to Night-Trader-Dev for starting and making this project feasible! He my fren :)**
+SageTree is a new, very new, experimental programming language. It was originally created by one person (Night-Traders-Dev as SageLang), picked up and heavily modified by another (MilkmanAbi), and is currently maintained by a single developer. Progress is slow. That is the honest reality, and we think that is okay.
 
 Sage is not trying to be the fastest language. It is not trying to replace anything. It is trying to be **kinder**. A language that tells you what went wrong instead of crashing silently. A language that gives you choices instead of forcing a single paradigm. A language that respects your time.
 

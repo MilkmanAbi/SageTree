@@ -344,7 +344,7 @@ proc replace_all(pattern, text, replacement):
         let end_pos = match_ops(ops, 0, text, i)
         if end_pos >= 0 and end_pos > i:
             result = result + replacement
-            i = stop_pos
+            i = end_pos
         else:
             result = result + text[i]
             i = i + 1
@@ -361,7 +361,7 @@ proc split_by(pattern, text):
         if end_pos >= 0 and end_pos > i:
             parts.push(current)
             current = ""
-            i = stop_pos
+            i = end_pos
         else:
             current = current + text[i]
             i = i + 1

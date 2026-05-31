@@ -24,6 +24,8 @@ static int _yields_are_sequential(Stmt* body);
 // Forward declarations for proc emission (used by STMT_IMPORT before definition)
 static void aot_emit_proc(AotCompiler* aot, Stmt* s);
 static void aot_emit_nested_procs(AotCompiler* aot, Stmt* body);
+// Forward declaration for recursion-cycle detection (used in aot_emit_proc before definition)
+static int aot_is_recursive_proc(AotCompiler* aot, Token name);
 // Forward declaration for expression compiler (used in aot_infer_types for default params)
 static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint);
 
@@ -115,8 +117,33 @@ static char* aot_escape(const char* s) {
 void aot_set_var_type(AotCompiler* aot, const char* name, JitTypeTag type) {
     for (int i = 0; i < aot->type_env.count; i++) {
         if (strcmp(aot->type_env.vars[i].name, name) == 0) {
-            if (aot->type_env.vars[i].inferred_type != type)
+            if (type == JIT_TYPE_UNKNOWN) {
+                // Setting to UNKNOWN: overwrite unconditionally (it's already the worst case)
                 aot->type_env.vars[i].inferred_type = JIT_TYPE_UNKNOWN;
+            } else if (aot->type_env.vars[i].inferred_type != type) {
+                // Conflict between two concrete types: demote to UNKNOWN
+                aot->type_env.vars[i].inferred_type = JIT_TYPE_UNKNOWN;
+            }
+            // else: same type, no change
+            return;
+        }
+    }
+    if (aot->type_env.count >= aot->type_env.capacity) {
+        aot->type_env.capacity = aot->type_env.capacity ? aot->type_env.capacity*2 : 64;
+        aot->type_env.vars = realloc(aot->type_env.vars, sizeof(AotVarType)*aot->type_env.capacity);
+    }
+    aot->type_env.vars[aot->type_env.count].name = strdup(name);
+    aot->type_env.vars[aot->type_env.count].inferred_type = type;
+    aot->type_env.count++;
+}
+
+// Force-set a variable's type, overwriting any existing entry.
+// Used inside proc/method bodies so inner-scope assignments shadow
+// outer-scope UNKNOWN entries (e.g. from the global pre-scan).
+static void aot_force_var_type(AotCompiler* aot, const char* name, JitTypeTag type) {
+    for (int i = 0; i < aot->type_env.count; i++) {
+        if (strcmp(aot->type_env.vars[i].name, name) == 0) {
+            aot->type_env.vars[i].inferred_type = type;
             return;
         }
     }
@@ -134,6 +161,24 @@ JitTypeTag aot_get_var_type(AotCompiler* aot, const char* name) {
         if (strcmp(aot->type_env.vars[i].name, name) == 0)
             return aot->type_env.vars[i].inferred_type;
     return JIT_TYPE_UNKNOWN;
+}
+
+// Returns 1 if `name` is a variable known to be in scope at compile time:
+// present in the type env (params, locals, top-level lets) or registered as a
+// file-scope global. A variable can legitimately have JIT_TYPE_UNKNOWN while
+// still being in scope, so membership — not type — is what we test. Used to
+// mirror the interpreter, which leaves an interpolation placeholder literal
+// when the inner expression would throw (e.g. undefined variable).
+static int aot_var_in_scope(AotCompiler* aot, const char* name) {
+    for (int i = 0; i < aot->type_env.count; i++)
+        if (strcmp(aot->type_env.vars[i].name, name) == 0) return 1;
+    for (int i = 0; i < aot->global_var_count; i++) {
+        // global_vars holds C-mangled names (e.g. "sg_foo"); compare both forms
+        const char* g = aot->global_vars[i];
+        if (strcmp(g, name) == 0) return 1;
+        if (strncmp(g, "sg_", 3) == 0 && strcmp(g + 3, name) == 0) return 1;
+    }
+    return 0;
 }
 
 static JitTypeTag aot_infer_expr(AotCompiler* aot, Expr* expr) {
@@ -173,7 +218,9 @@ static JitTypeTag aot_infer_expr(AotCompiler* aot, Expr* expr) {
                 if (op==TOKEN_PLUS||op==TOKEN_MINUS||op==TOKEN_STAR||op==TOKEN_SLASH)
                     return JIT_TYPE_FLOAT;
             }
-            if (L==JIT_TYPE_STRING && R==JIT_TYPE_STRING && op==TOKEN_PLUS) return JIT_TYPE_STRING;
+            // String concat: sage_rt_string_concat returns SageValue, not const char*
+            // Return UNKNOWN so STMT_LET declares sg_x as SageValue not const char*
+            if (L==JIT_TYPE_STRING && R==JIT_TYPE_STRING && op==TOKEN_PLUS) return JIT_TYPE_UNKNOWN;
             return JIT_TYPE_UNKNOWN;
         }
         case EXPR_CALL: {
@@ -182,7 +229,7 @@ static JitTypeTag aot_infer_expr(AotCompiler* aot, Expr* expr) {
                 int nl = expr->as.call.callee->as.variable.name.length;
                 #define BM(s) (nl==(int)strlen(s)&&memcmp(n,s,nl)==0)
                 if (BM("len")||BM("int")) return JIT_TYPE_INT;
-                if (BM("float")||BM("clock")) return JIT_TYPE_FLOAT;
+                if (BM("float")) return JIT_TYPE_FLOAT;
                 if (BM("str")||BM("typeof")) return JIT_TYPE_STRING;
                 if (BM("bool")) return JIT_TYPE_BOOL;
                 if (BM("range")||BM("range_inc")) return JIT_TYPE_ARRAY;
@@ -220,6 +267,28 @@ void aot_infer_types(AotCompiler* aot, Stmt* program) {
             if (ps->body && _has_yield(ps->body)) {
                 if (aot->known_ctor_count < 128)
                     snprintf(aot->known_ctors[aot->known_ctor_count++], 64, "%s", cn);
+            }
+            // Register param types from type annotations (: String, : Int, etc.)
+            if (ps->param_types) {
+                for (int _pi=0; _pi<ps->param_count; _pi++) {
+                    if (!ps->param_types[_pi]) continue;
+                    Token type_name = ps->param_types[_pi]->name;
+                    JitTypeTag pt = JIT_TYPE_UNKNOWN;
+                    int tl = type_name.length;
+                    const char* ts = type_name.start;
+                    if (tl==3 && !memcmp(ts,"Int",3))     pt=JIT_TYPE_INT;
+                    else if (tl==5 && !memcmp(ts,"Float",5))  pt=JIT_TYPE_FLOAT;
+                    else if (tl==4 && !memcmp(ts,"Bool",4))   pt=JIT_TYPE_BOOL;
+                    else if (tl==6 && !memcmp(ts,"String",6)) pt=JIT_TYPE_STRING;
+                    if (pt != JIT_TYPE_UNKNOWN) {
+                        // Register as procname#paramN → type
+                        char key[280];
+                        int fnl = ps->name.length < 255 ? ps->name.length : 255;
+                        snprintf(key, sizeof(key), "%.*s#%d", fnl, ps->name.start, _pi);
+                        if (aot_get_var_type(aot, key) == JIT_TYPE_UNKNOWN)
+                            aot_set_var_type(aot, key, pt);
+                    }
+                }
             }
             // Register default parameter values for call-site filling
             if (ps->defaults) {
@@ -306,7 +375,9 @@ static void aot_infer_body(AotCompiler* aot, Stmt* body) {
             char name[256];
             int len = s->as.let.name.length < 255 ? s->as.let.name.length : 255;
             memcpy(name, s->as.let.name.start, len); name[len] = '\0';
-            aot_set_var_type(aot, name, t);
+            // Use force-set: inner-scope var declarations always shadow outer UNKNOWN entries
+            // (e.g. global pre-scan sets outer x→UNKNOWN, inner proc's x should be STRING)
+            aot_force_var_type(aot, name, t);
         } else if (s->type == STMT_BLOCK) {
             aot_infer_body(aot, s->as.block.statements);
         } else if (s->type == STMT_FOR) {
@@ -326,7 +397,8 @@ static void aot_infer_body(AotCompiler* aot, Stmt* body) {
                 if (lt != JIT_TYPE_UNKNOWN && s->as.for_stmt.variable.length > 0) {
                     char vn[256]; int vl=s->as.for_stmt.variable.length<255?s->as.for_stmt.variable.length:255;
                     memcpy(vn,s->as.for_stmt.variable.start,vl); vn[vl]='\0';
-                    aot_set_var_type(aot, vn, lt);
+                    // Force-set: for-loop vars are always INT (or UNKNOWN if non-range) — always win over outer UNKNOWN
+                    aot_force_var_type(aot, vn, lt);
                 }
             }
             aot_infer_body(aot, s->as.for_stmt.body);
@@ -341,7 +413,7 @@ static void aot_infer_body(AotCompiler* aot, Stmt* body) {
 
 // Track known C-callable procs (not SageValue function vars)
 static void aot_register_proc(AotCompiler* aot, const char* name) {
-    if (aot->known_proc_count >= 256) return;
+    if (aot->known_proc_count >= 512) return;
     snprintf(aot->known_procs[aot->known_proc_count++], 64, "%s", name);
 }
 static int aot_is_known_proc(AotCompiler* aot, const char* name, int len) {
@@ -401,10 +473,19 @@ static char* aot_expr_boxed(AotCompiler* aot, Expr* e) {
         }
         // Other exprs: UNKNOWN hint auto-boxes binary ops etc.
         char* v = aot_expr(aot, e, JIT_TYPE_UNKNOWN);
-        if (strncmp(v, "sage_rt_", 8) == 0 || strncmp(v, "({", 2) == 0)
+        if (strncmp(v, "sage_rt_", 8) == 0 || strncmp(v, "({", 2) == 0 ||
+            strncmp(v, "_caps->", 7) == 0)  // closure capture fields are SageValue
             return v;
         char* boxed = aot_box(t, v);
         free(v);
+        return boxed;
+    }
+    // For STRING variables: aot_expr with UNKNOWN returns raw const char*, not SageValue.
+    // Explicitly box them so callers always get a SageValue.
+    if (t == JIT_TYPE_STRING && e->type == EXPR_VARIABLE) {
+        char* raw = aot_expr(aot, e, JIT_TYPE_STRING);
+        char* boxed = aot_box(JIT_TYPE_STRING, raw);
+        free(raw);
         return boxed;
     }
     return aot_expr(aot, e, JIT_TYPE_UNKNOWN);
@@ -453,7 +534,30 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
             if (!strcmp(name,"False")) return hint==JIT_TYPE_BOOL ? strdup("0") : strdup("sage_rt_bool(0)");
             JitTypeTag vtype = aot_get_var_type(aot,name);
             char* cname = aot_cname(expr->as.variable.name.start, expr->as.variable.name.length);
-            if (!jit_is_unboxed(vtype)) return cname;
+            if (!jit_is_unboxed(vtype)) {
+                // If this is a known proc being used as a value (not called directly),
+                // wrap it as sage_rt_make_fn so it can be passed to higher-order functions.
+                // Top-level procs have _mwrap_ adaptors emitted after their definitions.
+                // Module-internal procs use _sw_ wrappers from aot_emit_nested_procs.
+                // Only apply _mwrap_ for top-level procs (not when inside a module body).
+                if (vtype == JIT_TYPE_UNKNOWN && !aot->in_module_body &&
+                    aot_is_known_proc(aot, name, len)) {
+                    // Only emit _mwrap_ reference if this proc has a real STMT_PROC definition
+                    // (global stubs like sg_bytes don't have _mwrap_ wrappers)
+                    // Check: does _mwrap_cname exist in the emitted code? Use known_procs as proxy.
+                    char mwrap_name[80]; snprintf(mwrap_name,sizeof(mwrap_name),"_mwrap_%s",cname);
+                    int has_mwrap = 0;
+                    for(int _ki=0;_ki<aot->known_proc_count;_ki++)
+                        if(strcmp(aot->known_procs[_ki],mwrap_name)==0){has_mwrap=1;break;}
+                    if (has_mwrap) {
+                        char* out = malloc(strlen(cname)*2+80);
+                        sprintf(out, "sage_rt_make_fn((SageNativeFn)_mwrap_%s,NULL,\"%s\")", cname, name);
+                        free(cname); return out;
+                    }
+                    return cname;
+                }
+                return cname;
+            }
             // Caller wants same unboxed type, or any unboxed type (caller casts) — return raw name
             if (hint==vtype || hint==JIT_TYPE_UNKNOWN) return cname;
             if (jit_is_unboxed(hint)) return cname; // caller will cast (e.g. int->double)
@@ -501,14 +605,14 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
             if (L==JIT_TYPE_INT && R==JIT_TYPE_INT) {
                 char* lv = aot_expr(aot, expr->as.binary.left,  JIT_TYPE_INT);
                 char* rv = aot_expr(aot, expr->as.binary.right, JIT_TYPE_INT);
-                char* out = malloc(strlen(lv)+strlen(rv)+32);
+                char* out = malloc(strlen(lv)+strlen(rv)+96);
                 int is_cmp=0;
                 switch(op) {
                     case TOKEN_PLUS:    sprintf(out,"((%s)+(%s))",lv,rv); break;
                     case TOKEN_MINUS:   sprintf(out,"((%s)-(%s))",lv,rv); break;
                     case TOKEN_STAR:    sprintf(out,"((%s)*(%s))",lv,rv); break;
-                    case TOKEN_SLASH:   sprintf(out,"((%s)/(%s))",lv,rv); break;
-                    case TOKEN_PERCENT: sprintf(out,"((%s)%%(%s))",lv,rv); break;
+                    case TOKEN_SLASH:   sprintf(out,"({int64_t _dn=(%s),_dd=(%s); _dd?(_dn/_dd):INT64_C(0);})",lv,rv); break;
+                    case TOKEN_PERCENT: sprintf(out,"({int64_t _mn=(%s),_md=(%s); _md?(_mn%%_md):INT64_C(0);})",lv,rv); break;
                     case TOKEN_AMP:     sprintf(out,"((%s)&(%s))",lv,rv); break;
                     case TOKEN_PIPE:    sprintf(out,"((%s)|(%s))",lv,rv); break;
                     case TOKEN_CARET:   sprintf(out,"((%s)^(%s))",lv,rv); break;
@@ -557,35 +661,45 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
             }
 
             // -- String concat: box raw string vars; pass SageValue exprs directly --
+            // String concat: return SageValue (not JIT_TYPE_STRING to avoid const char* mismatch)
+            // aot_infer_expr returns STRING for this, but that would cause STMT_LET to declare
+            // sg_probe as const char* and then try to assign SageValue from sage_rt_string_concat.
+            // The fix: the hint guides whether we box or not.
             if (L==JIT_TYPE_STRING && R==JIT_TYPE_STRING && op==TOKEN_PLUS) {
-                // aot_expr(., UNKNOWN) returns const char* for STRING variables, SageValue for everything else
-                char* lv = aot_expr(aot, expr->as.binary.left,  JIT_TYPE_UNKNOWN);
-                char* rv = aot_expr(aot, expr->as.binary.right, JIT_TYPE_UNKNOWN);
-                int lv_needs_box = (expr->as.binary.left->type  == EXPR_VARIABLE);
-                int rv_needs_box = (expr->as.binary.right->type == EXPR_VARIABLE);
-                char* ls = lv_needs_box ? aot_box(JIT_TYPE_STRING, lv) : lv;
-                char* rs = rv_needs_box ? aot_box(JIT_TYPE_STRING, rv) : rv;
-                char* out = malloc(strlen(ls)+strlen(rs)+48);
-                sprintf(out,"sage_rt_string_concat(%s,%s)",ls,rs);
-                if (ls != lv) free(ls);
-                if (rs != rv) free(rs);
+                char* lv = aot_expr_boxed(aot, expr->as.binary.left);
+                char* rv = aot_expr_boxed(aot, expr->as.binary.right);
+                char* out = malloc(strlen(lv)+strlen(rv)+48);
+                sprintf(out,"sage_rt_string_concat(%s,%s)",lv,rv);
                 free(lv); free(rv); return out;
             }
 
             // -- Logical --
             if (op==TOKEN_AND) {
+                JitTypeTag lt=aot_infer_expr(aot,expr->as.binary.left);
+                JitTypeTag rt2=aot_infer_expr(aot,expr->as.binary.right);
                 char* lv=aot_expr(aot,expr->as.binary.left,JIT_TYPE_UNKNOWN);
                 char* rv=aot_expr(aot,expr->as.binary.right,JIT_TYPE_UNKNOWN);
-                char* out=malloc(strlen(lv)*2+strlen(rv)+64);
-                sprintf(out,"(sage_rt_truthy(%s)?(%s):(%s))",lv,rv,lv);
-                free(lv); free(rv); return out;
+                // sage_rt_truthy expects SageValue — box raw scalars
+                char* lv_b=(jit_is_unboxed(lt)&&strncmp(lv,"sage_rt_",8)!=0)?aot_box(lt,lv):lv;
+                char* rv_b=(jit_is_unboxed(rt2)&&strncmp(rv,"sage_rt_",8)!=0)?aot_box(rt2,rv):rv;
+                char* out=malloc(strlen(lv_b)*2+strlen(rv_b)+64);
+                sprintf(out,"(sage_rt_truthy(%s)?(%s):(%s))",lv_b,rv_b,lv_b);
+                if(lv_b!=lv){free(lv_b);} else {free(lv);}
+                if(rv_b!=rv){free(rv_b);} else {free(rv);}
+                return out;
             }
             if (op==TOKEN_OR) {
+                JitTypeTag lt=aot_infer_expr(aot,expr->as.binary.left);
+                JitTypeTag rt2=aot_infer_expr(aot,expr->as.binary.right);
                 char* lv=aot_expr(aot,expr->as.binary.left,JIT_TYPE_UNKNOWN);
                 char* rv=aot_expr(aot,expr->as.binary.right,JIT_TYPE_UNKNOWN);
-                char* out=malloc(strlen(lv)*2+strlen(rv)+64);
-                sprintf(out,"(sage_rt_truthy(%s)?(%s):(%s))",lv,lv,rv);
-                free(lv); free(rv); return out;
+                char* lv_b=(jit_is_unboxed(lt)&&strncmp(lv,"sage_rt_",8)!=0)?aot_box(lt,lv):lv;
+                char* rv_b=(jit_is_unboxed(rt2)&&strncmp(rv,"sage_rt_",8)!=0)?aot_box(rt2,rv):rv;
+                char* out=malloc(strlen(lv_b)*2+strlen(rv_b)+64);
+                sprintf(out,"(sage_rt_truthy(%s)?(%s):(%s))",lv_b,lv_b,rv_b);
+                if(lv_b!=lv){free(lv_b);} else {free(lv);}
+                if(rv_b!=rv){free(rv_b);} else {free(rv);}
+                return out;
             }
 
             // -- String repeat: "ha" * 3 or 3 * "ha" --
@@ -601,20 +715,11 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
                 if(svb!=sv)free(svb); free(sv); free(iv); return out;
             }
             // -- Generic fallback --
-            // aot_expr(expr, UNKNOWN) returns SageValue for everything EXCEPT
-            // EXPR_VARIABLE with an unboxed type (which returns the raw C name).
-            // So: only box bare unboxed variables; all other exprs are already SageValue.
+            // For EQ/NEQ/GT/LT/GTE/LTE/band/bor/bxor/shl/shr: always need SageValue args
+            // Use aot_expr_boxed to safely get boxed versions
             {
-                #define _NEEDS_BOX(e) ((e)->type == EXPR_VARIABLE && jit_is_unboxed(aot_infer_expr(aot,(e))))
-                char* _lraw = aot_expr(aot, expr->as.binary.left,  JIT_TYPE_UNKNOWN);
-                char* _rraw = aot_expr(aot, expr->as.binary.right, JIT_TYPE_UNKNOWN);
-                char* lv = _NEEDS_BOX(expr->as.binary.left)
-                    ? aot_box(aot_infer_expr(aot,expr->as.binary.left), _lraw) : _lraw;
-                char* rv = _NEEDS_BOX(expr->as.binary.right)
-                    ? aot_box(aot_infer_expr(aot,expr->as.binary.right), _rraw) : _rraw;
-                if (lv != _lraw) free(_lraw);
-                if (rv != _rraw) free(_rraw);
-                #undef _NEEDS_BOX
+                char* lv = aot_expr_boxed(aot, expr->as.binary.left);
+                char* rv = aot_expr_boxed(aot, expr->as.binary.right);
                 char* out=malloc(strlen(lv)+strlen(rv)+64);
                 switch(op) {
                     case TOKEN_PLUS:    sprintf(out,"sage_rt_add(%s,%s)",lv,rv); break;
@@ -676,13 +781,16 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
         }
         case EXPR_PROPAGATE: {
             char* inner=aot_expr(aot,expr->as.unwrap.operand,JIT_TYPE_UNKNOWN);
-            char* out=malloc(strlen(inner)+512);
+            char* out=malloc(strlen(inner)+1024);  // template is ~560 chars, need headroom
             sprintf(out,"({SageValue _pp=(%s);"
                     "if(SAGE_IS_NIL(_pp))return sage_rt_nil();"
                     "if(SAGE_IS_DICT(_pp)){SageValue _pt=sage_rt_dict_get(_pp,sage_rt_string(\"__type\"));"
                     "if(SAGE_IS_STRING(_pt)&&strcmp(_pt.as.string,\"Err\")==0)return _pp;"
                     "if(SAGE_IS_STRING(_pt)&&strcmp(_pt.as.string,\"Ok\")==0)"
-                    "{_pp=sage_rt_dict_get(_pp,sage_rt_string(\"value\"));}} _pp;})",inner);
+                    "{_pp=sage_rt_dict_get(_pp,sage_rt_string(\"value\"));}"
+                    "else if(SAGE_IS_STRING(_pt)&&strcmp(_pt.as.string,\"Some\")==0)"
+                    "{_pp=sage_rt_dict_get(_pp,sage_rt_string(\"value\"));}"
+                    "} _pp;})",inner);
             free(inner); return out;
         }
 
@@ -724,7 +832,7 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
             int pos=sprintf(out,"({SageValue %s=sage_rt_dict_new();",tmp);
             for(int i=0;i<n;i++){
                 char*ek=aot_escape(expr->as.dict.keys[i]);
-                char*ev=aot_expr(aot,expr->as.dict.values[i],JIT_TYPE_UNKNOWN);
+                char*ev=aot_expr_boxed(aot,expr->as.dict.values[i]);  // always box for dict_set
                 pos+=sprintf(out+pos,"sage_rt_dict_set(%s,sage_rt_string(\"%s\"),%s);",tmp,ek,ev);
                 free(ek);free(ev);
             }
@@ -754,13 +862,19 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
             }
             // For STRING, use str_index (supports negative indexing)
             if (objt == JIT_TYPE_STRING) {
-                // Box raw string variable before passing
                 char* obj_raw=aot_expr(aot,expr->as.index.array,JIT_TYPE_UNKNOWN);
                 int obj_is_raw=(expr->as.index.array->type==EXPR_VARIABLE);
                 char* obj=obj_is_raw?aot_box(JIT_TYPE_STRING,obj_raw):obj_raw;
-                char* idx=aot_expr(aot,expr->as.index.index,JIT_TYPE_INT);
+                char* idx_raw=aot_expr(aot,expr->as.index.index,JIT_TYPE_INT);
+                JitTypeTag idx_t=aot_infer_expr(aot,expr->as.index.index);
+                char *idx;
+                // If index expr returns SageValue (UNKNOWN or call result), unbox safely
+                if (idx_t==JIT_TYPE_UNKNOWN || strncmp(idx_raw,"sage_rt_",8)==0) {
+                    idx=malloc(strlen(idx_raw)+32);
+                    sprintf(idx,"(int64_t)SAGE_AS_INT64(%s)",idx_raw); free(idx_raw);
+                } else { idx=idx_raw; }
                 char* out=malloc(strlen(obj)+strlen(idx)+64);
-                sprintf(out,"sage_rt_str_index(%s,(int64_t)(%s))",obj,idx);
+                sprintf(out,"sage_rt_str_index(%s,%s)",obj,idx);
                 if(obj!=obj_raw)free(obj); free(obj_raw); free(idx); return out;
             }
             char* obj=aot_expr(aot,expr->as.index.array,JIT_TYPE_UNKNOWN);
@@ -768,15 +882,17 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
             char* idx_raw=aot_expr(aot,expr->as.index.index,JIT_TYPE_UNKNOWN);
             char* idx;
             if (jit_is_unboxed(idxt) && strncmp(idx_raw,"sage_rt_",8)!=0) {
-                // Raw scalar — box it
                 idx = aot_box(idxt, idx_raw);
                 free(idx_raw);
             } else {
-                idx = idx_raw; // already boxed or SageValue
+                idx = idx_raw;
             }
             char* out_idx=malloc(strlen(obj)+strlen(idx)+64);
             if (objt==JIT_TYPE_DICT || idxt==JIT_TYPE_STRING)
                 sprintf(out_idx,"sage_rt_dict_get(%s,%s)",obj,idx);
+            else if (objt==JIT_TYPE_UNKNOWN)
+                // Unknown type at compile-time — use universal indexer (handles strings and arrays)
+                sprintf(out_idx,"sage_rt_index(%s,%s)",obj,idx);
             else
                 sprintf(out_idx,"sage_rt_array_get(%s,%s)",obj,idx);
             free(obj); free(idx); return out_idx;
@@ -802,10 +918,20 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
         }
         case EXPR_SLICE: {
             char* obj=aot_expr(aot,expr->as.slice.array,JIT_TYPE_UNKNOWN);
-            char* s=expr->as.slice.start?aot_expr(aot,expr->as.slice.start,JIT_TYPE_INT):strdup("0");
-            char* e=expr->as.slice.end?aot_expr(aot,expr->as.slice.end,JIT_TYPE_INT):strdup("-1");
-            char* out=malloc(strlen(obj)+strlen(s)+strlen(e)+48);
-            sprintf(out,"sage_rt_array_slice(%s,(int)(%s),(int)(%s))",obj,s,e);
+            char* s_raw=expr->as.slice.start?aot_expr(aot,expr->as.slice.start,JIT_TYPE_INT):strdup("0");
+            char* e_raw=expr->as.slice.end?aot_expr(aot,expr->as.slice.end,JIT_TYPE_INT):strdup("-1");
+            // Safely unbox: if a SageValue expr, wrap in SAGE_AS_INT64
+            JitTypeTag s_t = expr->as.slice.start?aot_infer_expr(aot,expr->as.slice.start):JIT_TYPE_INT;
+            JitTypeTag e_t = expr->as.slice.end?aot_infer_expr(aot,expr->as.slice.end):JIT_TYPE_INT;
+            char *s, *e;
+            if (s_t==JIT_TYPE_UNKNOWN || strncmp(s_raw,"sage_rt_",8)==0) {
+                s=malloc(strlen(s_raw)+32); sprintf(s,"(int)SAGE_AS_INT64(%s)",s_raw); free(s_raw);
+            } else { s=s_raw; }
+            if (e_t==JIT_TYPE_UNKNOWN || strncmp(e_raw,"sage_rt_",8)==0) {
+                e=malloc(strlen(e_raw)+32); sprintf(e,"(int)SAGE_AS_INT64(%s)",e_raw); free(e_raw);
+            } else { e=e_raw; }
+            char* out=malloc(strlen(obj)+strlen(s)+strlen(e)+64);
+            sprintf(out,"sage_rt_array_slice(%s,%s,%s)",obj,s,e);
             free(obj);free(s);free(e); return out;
         }
         case EXPR_GET: {
@@ -841,7 +967,7 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
         case EXPR_SET: {
             if (expr->as.set.object) {
                 char* obj=aot_expr(aot,expr->as.set.object,JIT_TYPE_UNKNOWN);
-                char* val=aot_expr(aot,expr->as.set.value,JIT_TYPE_UNKNOWN);
+                char* val=aot_expr_boxed(aot,expr->as.set.value);
                 char* prop=aot_escape(expr->as.set.property.start);
                 prop[expr->as.set.property.length]='\0';
                 // val appears twice in sprintf output
@@ -850,6 +976,7 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
                 free(obj);free(val);free(prop); return out;
             }
             char* name=aot_cname(expr->as.set.property.start,expr->as.set.property.length);
+            // For SageValue vars, the value must match the declared type
             char* val=aot_expr(aot,expr->as.set.value,JIT_TYPE_UNKNOWN);
             char* out=malloc(strlen(name)+strlen(val)+16);
             sprintf(out,"(%s=%s)",name,val);
@@ -956,6 +1083,23 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
                     else sprintf(o,"sage_rt_str_cast(%s)",arg);
                     if(arg!=a) { free(arg); } free(a); return o;
                 }
+                // contains(haystack, needle) — builtin string/array membership test
+                if (BM("contains")&&argc==2){
+                    char*a=aot_expr_boxed(aot,expr->as.call.args[0]);
+                    char*b=aot_expr_boxed(aot,expr->as.call.args[1]);
+                    char*o=malloc(strlen(a)*3+strlen(b)*2+200);
+                    // For strings: use sage_rt_str_find; for arrays: use sage_rt_array_contains
+                    sprintf(o,"(SAGE_IS_STRING(%s)?sage_rt_bool(sage_rt_str_find(%s,%s).as.integer>=0):sage_rt_bool(sage_rt_truthy(sage_rt_method_call(%s,\"contains\",1,(SageValue[]){%s}))))",a,a,b,a,b);
+                    free(a);free(b);return o;
+                }
+                if (BM("hash")&&argc==1){
+                    char*a=aot_expr_boxed(aot,expr->as.call.args[0]);
+                    char*o=malloc(strlen(a)+200);
+                    // hash() returns an integer hash: proper string hash for strings,
+                    // pointer identity otherwise.
+                    sprintf(o,"({SageValue _hv=%s;SAGE_IS_STRING(_hv)?sage_rt_int((int64_t)sage_rt_str_hash(_hv)):sage_rt_int((int64_t)(uintptr_t)_hv.as.string);})",a);
+                    free(a);return o;
+                }
                 if (BM("typeof")&&argc==1){
                     JitTypeTag _at=aot_infer_expr(aot,expr->as.call.args[0]);
                     char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);
@@ -964,6 +1108,19 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
                     char*o=malloc(strlen(_arg)+32);sprintf(o,"sage_rt_typeof(%s)",_arg);
                     if(_arg!=a)free(_arg);free(a);return o;
                 }
+                // type() — lowercase names (array, dict, etc.) matching interpreter
+                if (BM("type")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);char*o=malloc(strlen(a)+32);sprintf(o,"sage_rt_type_lc(%s)",a);free(a);return o;}
+                // ord(char) → integer codepoint
+                if (BM("ord")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);char*o=malloc(strlen(a)*3+128);sprintf(o,"sage_rt_int((int64_t)(unsigned char)((SAGE_IS_STRING(%s)&&%s.as.string)?%s.as.string[0]:0))",a,a,a);free(a);return o;}
+                // chr(n) → single-char string
+                if (BM("chr")&&argc==1){
+                    char*a=aot_expr_boxed(aot,expr->as.call.args[0]);
+                    char*o=malloc(strlen(a)+128);
+                    sprintf(o,"({char _chr[2]={(char)SAGE_AS_INT64(%s),0};sage_rt_string(_chr);})",a);
+                    free(a);return o;
+                }
+                // len() → array/string length
+                if (BM("len")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);char*o=malloc(strlen(a)+32);sprintf(o,"sage_rt_len(%s)",a);free(a);return o;}
                 if (BM("bool")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*o=malloc(strlen(a)+32);sprintf(o,"sage_rt_bool_cast(%s)",a);free(a);return o;}
                 if (BM("range")&&argc==2){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*b=aot_expr(aot,expr->as.call.args[1],JIT_TYPE_UNKNOWN);char*o=malloc(strlen(a)+strlen(b)+32);sprintf(o,"sage_rt_range(%s,%s)",a,b);free(a);free(b);return o;}
                 if (BM("range")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*o=malloc(strlen(a)+64);sprintf(o,"sage_rt_range(sage_rt_int(0),%s)",a);free(a);return o;}
@@ -973,12 +1130,152 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
                 if (BM("gc_collect")&&argc==0) return strdup("({sage_rt_gc_collect();sage_rt_nil();})");
                 if (BM("gc_disable")&&argc==0) return strdup("({sage_rt_gc_disable();sage_rt_nil();})");
                 if (BM("gc_enable")&&argc==0)  return strdup("({sage_rt_gc_enable();sage_rt_nil();})");
-                if (BM("Some")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*o=malloc(strlen(a)+48);sprintf(o,"sage_rt_some(%s)",a);free(a);return o;}
-                if (BM("Ok")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*o=malloc(strlen(a)+48);sprintf(o,"sage_rt_ok(%s)",a);free(a);return o;}
-                if (BM("Err")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*o=malloc(strlen(a)+48);sprintf(o,"sage_rt_err(%s)",a);free(a);return o;}
+                // Some/Ok/Err builtins — but only when no user/module proc of that
+                // name shadows them. Inside e.g. lib/safety.sage, `Some` refers to the
+                // module's own proc (sg_safety_sg_Some), not the runtime builtin, so we
+                // must fall through to the normal call path in that case.
+                {
+                    int _shadowed = 0;
+                    if (aot->current_module_prefix[0]) {
+                        // Module procs are mangled as <module_prefix>sg_<rawname>
+                        // (aot_cname_tok prepends sg_ to the raw name).
+                        char _pfxname[200];
+                        snprintf(_pfxname, sizeof(_pfxname), "%ssg_%.*s", aot->current_module_prefix, (int)rawlen, raw);
+                        if (aot_is_known_proc(aot, _pfxname, (int)strlen(_pfxname))) _shadowed = 1;
+                    }
+                    if (!_shadowed) {
+                        if (BM("Some")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*o=malloc(strlen(a)+48);sprintf(o,"sage_rt_some(%s)",a);free(a);return o;}
+                        if (BM("Ok")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*o=malloc(strlen(a)+48);sprintf(o,"sage_rt_ok(%s)",a);free(a);return o;}
+                        if (BM("Err")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*o=malloc(strlen(a)+48);sprintf(o,"sage_rt_err(%s)",a);free(a);return o;}
+                    }
+                }
                 // -- String/array builtins (bare function form) --
                 // join() builtin
                 // -- C struct layout builtins --
+                // -- Atomic builtins (bare form) — real runtime support --
+                if (BM("atomic_new")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_atomic_new(%s)",a);free(a);return o;}
+                if (BM("atomic_load")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_atomic_load(%s)",a);free(a);return o;}
+                if (BM("atomic_store")&&argc==2){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);char*b=aot_expr_boxed(aot,expr->as.call.args[1]);size_t sz=strlen(a)+strlen(b)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_atomic_store(%s,%s)",a,b);free(a);free(b);return o;}
+                if (BM("atomic_add")&&argc==2){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);char*b=aot_expr_boxed(aot,expr->as.call.args[1]);size_t sz=strlen(a)+strlen(b)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_atomic_add(%s,%s)",a,b);free(a);free(b);return o;}
+                if (BM("atomic_sub")&&argc==2){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);char*b=aot_expr_boxed(aot,expr->as.call.args[1]);size_t sz=strlen(a)+strlen(b)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_atomic_sub(%s,%s)",a,b);free(a);free(b);return o;}
+                if (BM("atomic_cas")&&argc==3){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);char*b=aot_expr_boxed(aot,expr->as.call.args[1]);char*c=aot_expr_boxed(aot,expr->as.call.args[2]);size_t sz=strlen(a)+strlen(b)+strlen(c)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_atomic_cas(%s,%s,%s)",a,b,c);free(a);free(b);free(c);return o;}
+                if (BM("atomic_exchange")&&argc==2){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);char*b=aot_expr_boxed(aot,expr->as.call.args[1]);size_t sz=strlen(a)+strlen(b)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_atomic_exchange(%s,%s)",a,b);free(a);free(b);return o;}
+                // -- CPU topology builtins --
+                if ((BM("cpu_count")||BM("cpu_logical_cores")||BM("smp_count"))&&argc==0) return strdup("sage_rt_cpu_count()");
+                if (BM("cpu_physical_cores")&&argc==0) return strdup("sage_rt_cpu_physical_cores()");
+                if (BM("cpu_has_hyperthreading")&&argc==0) return strdup("sage_rt_cpu_has_hyperthreading()");
+                // -- Semaphore builtins (bare form) --
+                if (BM("sem_new")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_sem_new(%s)",a);free(a);return o;}
+                if (BM("sem_wait")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_sem_wait(%s)",a);free(a);return o;}
+                if (BM("sem_post")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_sem_post(%s)",a);free(a);return o;}
+                if (BM("sem_trywait")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_sem_trywait(%s)",a);free(a);return o;}
+                // -- Threading / mutex stubs (no real threads in AOT) --
+                if (BM("spawn")||BM("thread_spawn")||BM("thread_join")||BM("thread_id")||
+                    BM("mutex_new")||BM("mutex_lock")||BM("mutex_unlock")||BM("mutex_try_lock")||
+                    BM("semaphore_new")||BM("semaphore_wait")||BM("semaphore_signal")||
+                    BM("rwlock_new")||BM("rwlock_read")||BM("rwlock_write")||BM("rwlock_release")||
+                    BM("condvar_new")||BM("condvar_wait")||BM("condvar_signal")||BM("condvar_broadcast")) {
+                    return strdup("sage_rt_nil()");
+                }
+                // -- Inline assembly stubs (asm_compile is cross-compile; not in AOT) --
+                if (BM("asm_compile")) {
+                    return strdup("sage_rt_nil()");
+                }
+                // -- Signal handling stubs --
+                if (BM("signal_set")||BM("signal_raise")||BM("signal_ignore")) {
+                    return strdup("sage_rt_nil()");
+                }
+                // -- Pthread/threading globals stubs --
+                if (BM("threadpool_new")||BM("threadpool_submit")||BM("threadpool_shutdown")||
+                    BM("thread_sleep")||BM("thread_yield")) {
+                    return strdup("sage_rt_nil()");
+                }
+                // -- GC mode/stats builtins --
+                if (BM("gc_mode")&&argc==0) return strdup("sage_rt_gc_mode()");
+                if (BM("gc_set_arc")&&argc==0) return strdup("({sage_rt_gc_set_arc();sage_rt_nil();})");
+                if (BM("gc_set_orc")&&argc==0) return strdup("({sage_rt_gc_set_orc();sage_rt_nil();})");
+                if (BM("gc_set_tracing")&&argc==0) return strdup("({sage_rt_gc_set_tracing();sage_rt_nil();})");
+                if (BM("gc_collections")&&argc==0) return strdup("sage_rt_gc_collections()");
+                if (BM("gc_stats")&&argc==0) return strdup("sage_rt_gc_stats_dict()");
+                if (BM("gc_alloc_count")&&argc==0) return strdup("sage_rt_gc_collections()");
+                if (BM("addressof")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_addressof(%s)",a);free(a);return o;}
+                if (BM("mem_size")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_mem_size(%s)",a);free(a);return o;}
+                if (BM("mem_copy")||BM("mem_zero")) {
+                    if (argc>=1) { char*a=aot_expr_boxed(aot,expr->as.call.args[0]); char*o=malloc(strlen(a)+32); sprintf(o,"sage_rt_nil()/*%s*/",a); free(a); return o; }
+                    return strdup("sage_rt_nil()");
+                }
+                // -- Path utilities --
+                if (BM("path_join")&&argc>=1){
+                    // Build a SageValue[] arg array and call the variadic helper.
+                    size_t cap=64; for(int i=0;i<argc;i++){char*a=aot_expr_boxed(aot,expr->as.call.args[i]);cap+=strlen(a)+8;free(a);}
+                    char*o=malloc(cap); int pos=sprintf(o,"sage_rt_path_join(%d,(SageValue[]){",argc);
+                    for(int i=0;i<argc;i++){char*a=aot_expr_boxed(aot,expr->as.call.args[i]);pos+=sprintf(o+pos,"%s%s",i?",":"",a);free(a);}
+                    sprintf(o+pos,"})"); return o;
+                }
+                if (BM("path_dirname")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_path_dirname(%s)",a);free(a);return o;}
+                if (BM("path_basename")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_path_basename(%s)",a);free(a);return o;}
+                if (BM("path_ext")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_path_ext(%s)",a);free(a);return o;}
+                if (BM("path_stem")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_path_stem(%s)",a);free(a);return o;}
+                if (BM("path_exists")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_path_exists(%s)",a);free(a);return o;}
+                // -- Bytes builtins --
+                if (BM("bytes")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_bytes_ctor(%s)",a);free(a);return o;}
+                if (BM("bytes")&&argc==0){return strdup("sage_rt_bytes_new(0)");}
+                if (BM("bytes_len")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_bytes_len_v(%s)",a);free(a);return o;}
+                if (BM("bytes_get")&&argc==2){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);char*b=aot_expr_boxed(aot,expr->as.call.args[1]);size_t sz=strlen(a)+strlen(b)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_bytes_get_v(%s,%s)",a,b);free(a);free(b);return o;}
+                if (BM("bytes_set")&&argc==3){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);char*b=aot_expr_boxed(aot,expr->as.call.args[1]);char*c=aot_expr_boxed(aot,expr->as.call.args[2]);size_t sz=strlen(a)+strlen(b)+strlen(c)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_bytes_set_v(%s,%s,%s)",a,b,c);free(a);free(b);free(c);return o;}
+                if ((BM("bytes_to_string")||BM("bytes_to_str"))&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_bytes_to_string(%s)",a);free(a);return o;}
+                if ((BM("bytes_from_string")||BM("bytes_from_str"))&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_bytes_from_string(%s)",a);free(a);return o;}
+                if (BM("bytes_slice")&&argc>=2){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);char*b=aot_expr_boxed(aot,expr->as.call.args[1]);char*c=argc>=3?aot_expr_boxed(aot,expr->as.call.args[2]):strdup("sage_rt_nil()");size_t sz=strlen(a)+strlen(b)+strlen(c)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_bytes_slice(%s,%s,%s)",a,b,c);free(a);free(b);free(c);return o;}
+                if (BM("bytes_push")&&argc==2){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);char*b=aot_expr_boxed(aot,expr->as.call.args[1]);size_t sz=strlen(a)+strlen(b)+64;char*o=malloc(sz);snprintf(o,sz,"({sage_rt_bytes_push(%s,(uint8_t)SAGE_AS_INT64(%s));sage_rt_nil();})",a,b);free(a);free(b);return o;}
+                // -- doc(fn): compile-time docstring lookup --
+                if (BM("doc")&&argc==1 && expr->as.call.args[0]->type==EXPR_VARIABLE){
+                    Token nt = expr->as.call.args[0]->as.variable.name;
+                    const char* dstr = NULL; int found = 0;
+                    for (int _di=0; _di<aot->proc_doc_count; _di++){
+                        if ((int)strlen(aot->proc_docs[_di].name)==(int)nt.length &&
+                            memcmp(aot->proc_docs[_di].name, nt.start, nt.length)==0){
+                            dstr = aot->proc_docs[_di].doc; found = 1; break;
+                        }
+                    }
+                    if (found){
+                        if (!dstr) return strdup("sage_rt_nil()");
+                        char* esc = aot_escape(dstr);
+                        char* o = malloc(strlen(esc)+32);
+                        sprintf(o, "sage_rt_string(\"%s\")", esc);
+                        free(esc); return o;
+                    }
+                    return strdup("sage_rt_nil()");
+                }
+                // -- C FFI --
+                if (BM("ffi_open")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_ffi_open(%s)",a);free(a);return o;}
+                if (BM("ffi_close")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_ffi_close(%s)",a);free(a);return o;}
+                if (BM("ffi_sym")&&argc==2){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);char*b=aot_expr_boxed(aot,expr->as.call.args[1]);size_t sz=strlen(a)+strlen(b)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_ffi_sym(%s,%s)",a,b);free(a);free(b);return o;}
+                if (BM("ffi_call")&&argc>=3){
+                    char*l=aot_expr_boxed(aot,expr->as.call.args[0]);
+                    char*f=aot_expr_boxed(aot,expr->as.call.args[1]);
+                    char*r=aot_expr_boxed(aot,expr->as.call.args[2]);
+                    char*as_=(argc>=4)?aot_expr_boxed(aot,expr->as.call.args[3]):strdup("sage_rt_nil()");
+                    size_t sz=strlen(l)+strlen(f)+strlen(r)+strlen(as_)+64;
+                    char*o=malloc(sz); snprintf(o,sz,"sage_rt_ffi_call(%s,%s,%s,%s)",l,f,r,as_);
+                    free(l);free(f);free(r);free(as_);return o;
+                }
+                // -- inline assembly --
+                if (BM("asm_arch")&&argc==0) return strdup("sage_rt_asm_arch()");
+                if (BM("asm_exec")&&argc>=2){
+                    size_t cap=64; for(int i=0;i<argc;i++){char*a=aot_expr_boxed(aot,expr->as.call.args[i]);cap+=strlen(a)+8;free(a);}
+                    char*o=malloc(cap); int pos=sprintf(o,"sage_rt_asm_exec(%d,(SageValue[]){",argc);
+                    for(int i=0;i<argc;i++){char*a=aot_expr_boxed(aot,expr->as.call.args[i]);pos+=sprintf(o+pos,"%s%s",i?",":"",a);free(a);}
+                    sprintf(o+pos,"})"); return o;
+                }
+                // -- sizeof --
+                if (BM("sizeof")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_sizeof(%s)",a);free(a);return o;}
+                // -- pointer arithmetic --
+                if (BM("ptr_add")&&argc==2){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);char*b=aot_expr_boxed(aot,expr->as.call.args[1]);size_t sz=strlen(a)+strlen(b)+48;char*o=malloc(sz);snprintf(o,sz,"sage_rt_ptr_add(%s,%s)",a,b);free(a);free(b);return o;}
+                if (BM("ptr_sub")&&argc==2){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);char*b=aot_expr_boxed(aot,expr->as.call.args[1]);size_t sz=strlen(a)+strlen(b)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_ptr_add(%s,sage_rt_int(-SAGE_AS_INT64(%s)))",a,b);free(a);free(b);return o;}
+                // -- Python FFI stubs --
+                if (BM("python_init")||BM("python_eval")||BM("python_call")||BM("python_import")) {
+                    return strdup("sage_rt_nil()");
+                }
                 if (BM("struct_def")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_struct_def(%s)",a);free(a);return o;}
                 if (BM("struct_new")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_struct_new(%s)",a);free(a);return o;}
                 if (BM("struct_get")&&argc==3){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*b=aot_expr(aot,expr->as.call.args[1],JIT_TYPE_UNKNOWN);char*c=aot_expr(aot,expr->as.call.args[2],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)+strlen(b)+strlen(c)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_struct_get(%s,%s,%s)",a,b,c);free(a);free(b);free(c);return o;}
@@ -987,7 +1284,7 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
                 // -- Manual memory builtins --
                 if (BM("mem_alloc")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_mem_alloc(%s)",a);free(a);return o;}
                 if (BM("mem_free")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"({sage_rt_mem_free(%s);sage_rt_nil();})",a);free(a);return o;}
-                if (BM("mem_read")&&argc==3){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*b=aot_expr(aot,expr->as.call.args[1],JIT_TYPE_UNKNOWN);char*c=aot_expr(aot,expr->as.call.args[2],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)+strlen(b)+strlen(c)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_mem_read(%s,%s,%s)",a,b,c);free(a);free(b);free(c);return o;}
+                if (BM("mem_read")&&argc==3){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);char*b=aot_expr_boxed(aot,expr->as.call.args[1]);char*c=aot_expr_boxed(aot,expr->as.call.args[2]);size_t sz=strlen(a)+strlen(b)+strlen(c)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_mem_read(%s,%s,%s)",a,b,c);free(a);free(b);free(c);return o;}
                 if (BM("mem_write")&&argc==4){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*b=aot_expr(aot,expr->as.call.args[1],JIT_TYPE_UNKNOWN);char*c=aot_expr(aot,expr->as.call.args[2],JIT_TYPE_UNKNOWN);char*d=aot_expr(aot,expr->as.call.args[3],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)+strlen(b)+strlen(c)+strlen(d)+64;char*o=malloc(sz);snprintf(o,sz,"({sage_rt_mem_write(%s,%s,%s,%s);sage_rt_nil();})",a,b,c,d);free(a);free(b);free(c);free(d);return o;}
                 if (BM("precision")&&argc==2){
                     char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);
@@ -1000,7 +1297,7 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
                     snprintf(o,sz,"sage_rt_precision(%s,%s)",a,bb);
                     if(bb!=b)free(bb);free(a);free(b);return o;
                 }
-                if (BM("tonumber")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_tonumber(%s)",a);free(a);return o;}
+                if (BM("tonumber")&&argc==1){char*a=aot_expr_boxed(aot,expr->as.call.args[0]);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_tonumber(%s)",a);free(a);return o;}
                 if (BM("join")&&argc==2){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*b=aot_expr(aot,expr->as.call.args[1],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)+strlen(b)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_array_join(%s,%s)",a,b);free(a);free(b);return o;}
                 if (BM("string_join")&&argc==2){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*b=aot_expr(aot,expr->as.call.args[1],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)+strlen(b)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_array_join(%s,%s)",a,b);free(a);free(b);return o;}
                 // Dict builtins (bare function form)
@@ -1011,7 +1308,23 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
                 if (BM("dict_values")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_dict_values(%s)",a);free(a);return o;}
                 if (BM("dict_len")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_dict_len(%s)",a);free(a);return o;}
                 // Slice/range builtins
-                if (BM("slice")&&argc==3){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*b=aot_expr(aot,expr->as.call.args[1],JIT_TYPE_INT);char*d=aot_expr(aot,expr->as.call.args[2],JIT_TYPE_INT);size_t sz=strlen(a)+strlen(b)+strlen(d)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_array_slice(%s,(int)(%s),(int)(%s))",a,b,d);free(a);free(b);free(d);return o;}
+                if (BM("slice")&&argc==3){
+                    char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);
+                    char*b_raw=aot_expr(aot,expr->as.call.args[1],JIT_TYPE_INT);
+                    char*d_raw=aot_expr(aot,expr->as.call.args[2],JIT_TYPE_INT);
+                    JitTypeTag bt=aot_infer_expr(aot,expr->as.call.args[1]);
+                    JitTypeTag dt=aot_infer_expr(aot,expr->as.call.args[2]);
+                    char *b, *d;
+                    if (bt==JIT_TYPE_UNKNOWN||strncmp(b_raw,"sage_rt_",8)==0) {
+                        b=malloc(strlen(b_raw)+32); sprintf(b,"(int)SAGE_AS_INT64(%s)",b_raw); free(b_raw);
+                    } else b=b_raw;
+                    if (dt==JIT_TYPE_UNKNOWN||strncmp(d_raw,"sage_rt_",8)==0) {
+                        d=malloc(strlen(d_raw)+32); sprintf(d,"(int)SAGE_AS_INT64(%s)",d_raw); free(d_raw);
+                    } else d=d_raw;
+                    size_t sz=strlen(a)+strlen(b)+strlen(d)+64;
+                    char*o=malloc(sz); snprintf(o,sz,"sage_rt_array_slice(%s,%s,%s)",a,b,d);
+                    free(a);free(b);free(d);return o;
+                }
                 if (BM("upper")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_str_upper(%s)",a);free(a);return o;}
                 if (BM("lower")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_str_lower(%s)",a);free(a);return o;}
                 if (BM("strip")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_str_strip(%s)",a);free(a);return o;}
@@ -1024,6 +1337,7 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
                     free(a);return o;
                 }
                 if (BM("push")&&argc==2){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*b=aot_expr_boxed(aot,expr->as.call.args[1]);size_t sz=strlen(a)+strlen(b)+64;char*o=malloc(sz);snprintf(o,sz,"({sage_rt_array_push(%s,%s);sage_rt_nil();})",a,b);free(a);free(b);return o;}
+                if (BM("append")&&argc==2){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*b=aot_expr_boxed(aot,expr->as.call.args[1]);size_t sz=strlen(a)+strlen(b)+64;char*o=malloc(sz);snprintf(o,sz,"({sage_rt_array_push(%s,%s);sage_rt_nil();})",a,b);free(a);free(b);return o;}
                 if (BM("pop")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)+64;char*o=malloc(sz);snprintf(o,sz,"sage_rt_array_pop(%s)",a);free(a);return o;}
                 if (BM("abs")&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)*3+128;char*o=malloc(sz);snprintf(o,sz,"(SAGE_IS_INT(%s)?sage_rt_int(llabs(%s.as.integer)):sage_rt_float(fabs(%s.as.number)))",a,a,a);free(a);return o;}
                 if (BM("min")&&argc==2){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*b=aot_expr(aot,expr->as.call.args[1],JIT_TYPE_UNKNOWN);size_t sz=strlen(a)+strlen(b)+128;char*o=malloc(sz);snprintf(o,sz,"(sage_rt_less(%s,%s)?(%s):(%s))",a,b,a,b);free(a);free(b);return o;}
@@ -1087,20 +1401,20 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
                 // Inside module body: rewrite sg_procname to sg_MODULENAME_sg_procname
                 // so recursive/cross-function calls within a module use the correct symbol
                 if (aot->in_module_body && aot->current_module_prefix[0]) {
-                    char prefixed[256]; snprintf(prefixed,sizeof(prefixed),"%s%s",aot->current_module_prefix,fname+3); // strip sg_ from fname, add full prefix
-                    // Only rewrite if this is actually a module function (not a builtin)
+                    char prefixed[256]; snprintf(prefixed,sizeof(prefixed),"%s%s",aot->current_module_prefix,fname);
+                    int found_pfx = 0;
                     for(int _ki=0;_ki<aot->known_proc_count;_ki++){
-                        if(strcmp(aot->known_procs[_ki],prefixed)==0){
-                            free(fname); fname=strdup(prefixed); break;
-                        }
+                        if(strcmp(aot->known_procs[_ki],prefixed)==0){ found_pfx=1; break; }
                     }
+                    if (found_pfx) { free(fname); fname=strdup(prefixed); }
                 }
                 size_t total=strlen(fname)+32;
                 // Count total params including defaulted ones for buffer sizing
                 int emit_argc_pre = argc;
                 for (int _di=0; _di<aot->proc_default_count; _di++) {
                     if (strcmp(aot->proc_defaults[_di].proc_cname, fname)==0 &&
-                        aot->proc_defaults[_di].param_idx >= emit_argc_pre)
+                        aot->proc_defaults[_di].param_idx >= emit_argc_pre &&
+                        aot->proc_defaults[_di].param_idx < 32) // safety cap
                         emit_argc_pre = aot->proc_defaults[_di].param_idx + 1;
                 }
                 for(int i=0;i<argc;i++){
@@ -1124,11 +1438,22 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
                         JitTypeTag pt=is_ctor?JIT_TYPE_UNKNOWN:aot_param_type(aot,raw,rawlen,i);
                         JitTypeTag ah=(!is_ctor&&jit_is_unboxed(pt))?pt:JIT_TYPE_UNKNOWN;
                         char*a=aot_expr(aot,expr->as.call.args[i],ah);
-                        // Box if passing SageValue to typed param
                         char*fa=a;
                         if(!is_ctor && jit_is_unboxed(pt)){
+                            // Typed param: box incoming SageValue
                             JitTypeTag at=aot_infer_expr(aot,expr->as.call.args[i]);
                             if(!jit_is_unboxed(at)){fa=aot_box(pt,a);}
+                        } else if (!is_ctor && pt == JIT_TYPE_UNKNOWN) {
+                            // Untyped param (SageValue expected): box any raw scalar.
+                            // The arg must end up as a SageValue. If its inferred type
+                            // is unboxed (int/float/bool) and the emitted C is a raw
+                            // scalar (not already a sage_rt_* boxed expression), box it.
+                            // This covers literals (identity(10)) and bare variables
+                            // alike. Compound array/dict/tuple temps emit as ({...;})
+                            // which is already a SageValue, so they are left as-is.
+                            JitTypeTag at=aot_infer_expr(aot,expr->as.call.args[i]);
+                            int already_boxed = (strncmp(a,"sage_rt_",8)==0 || strncmp(a,"({",2)==0);
+                            if (jit_is_unboxed(at) && !already_boxed) fa = aot_box(at, a);
                         }
                         pos+=sprintf(out+pos,"%s%s",i>0?", ":"",fa);
                         if(fa!=a)free(fa); free(a);
@@ -1239,15 +1564,90 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
                     for (int _mi=0; _mi<aot->imported_module_count; _mi++) {
                         if (strcmp(aot->imported_modules[_mi], _mod_raw)==0) { _is_module=1; break; }
                     }
+                    // python.* — native Python FFI (handled regardless of the
+                    // normal module-import bookkeeping).
+                    if (strcmp(_mod_raw,"python")==0) {
+                        const char* pn = ge->as.get.property.start;
+                        int pl = ge->as.get.property.length;
+                        #define _PYM(s) ((int)strlen(s)==pl && memcmp(pn,s,pl)==0)
+                        char* a0 = argc>0 ? aot_expr_boxed(aot,expr->as.call.args[0]) : strdup("sage_rt_nil()");
+                        if (_PYM("import")) { size_t z=strlen(a0)+48; char*o=malloc(z); snprintf(o,z,"sage_rt_py_import(%s)",a0); free(a0); free(_mobj_raw); return o; }
+                        if (_PYM("eval"))   { size_t z=strlen(a0)+48; char*o=malloc(z); snprintf(o,z,"sage_rt_py_eval(%s)",a0); free(a0); free(_mobj_raw); return o; }
+                        if (_PYM("exec"))   { size_t z=strlen(a0)+48; char*o=malloc(z); snprintf(o,z,"sage_rt_py_exec(%s)",a0); free(a0); free(_mobj_raw); return o; }
+                        if (_PYM("getattr")){ char* a1=argc>1?aot_expr_boxed(aot,expr->as.call.args[1]):strdup("sage_rt_nil()"); size_t z=strlen(a0)+strlen(a1)+48; char*o=malloc(z); snprintf(o,z,"sage_rt_py_getattr(%s,%s)",a0,a1); free(a0);free(a1);free(_mobj_raw); return o; }
+                        if (_PYM("call")) {
+                            // python.call(obj, method, ...args)
+                            char* a1=argc>1?aot_expr_boxed(aot,expr->as.call.args[1]):strdup("sage_rt_nil()");
+                            int extra=argc>2?argc-2:0;
+                            size_t z=strlen(a0)+strlen(a1)+96;
+                            char** ev=malloc(sizeof(char*)*(extra>0?extra:1));
+                            for(int i=0;i<extra;i++){ev[i]=aot_expr_boxed(aot,expr->as.call.args[i+2]);z+=strlen(ev[i])+4;}
+                            char*o=malloc(z); int p;
+                            if(extra>0){
+                                p=sprintf(o,"sage_rt_py_call(%s,%s,%d,(SageValue[]){",a0,a1,extra);
+                                for(int i=0;i<extra;i++){p+=sprintf(o+p,"%s%s",i?",":"",ev[i]);free(ev[i]);}
+                                sprintf(o+p,"})");
+                            } else {
+                                sprintf(o,"sage_rt_py_call(%s,%s,0,NULL)",a0,a1);
+                            }
+                            free(ev);free(a0);free(a1);free(_mobj_raw); return o;
+                        }
+                        if (_PYM("invoke")) {
+                            int extra=argc>1?argc-1:0;
+                            size_t z=strlen(a0)+96;
+                            char** ev=malloc(sizeof(char*)*(extra>0?extra:1));
+                            for(int i=0;i<extra;i++){ev[i]=aot_expr_boxed(aot,expr->as.call.args[i+1]);z+=strlen(ev[i])+4;}
+                            char*o=malloc(z); int p;
+                            if(extra>0){
+                                p=sprintf(o,"sage_rt_py_invoke(%s,%d,(SageValue[]){",a0,extra);
+                                for(int i=0;i<extra;i++){p+=sprintf(o+p,"%s%s",i?",":"",ev[i]);free(ev[i]);}
+                                sprintf(o+p,"})");
+                            } else {
+                                sprintf(o,"sage_rt_py_invoke(%s,0,NULL)",a0);
+                            }
+                            free(ev);free(a0);free(_mobj_raw); return o;
+                        }
+                        free(a0);
+                        #undef _PYM
+                    }
                     if (_is_module) {
+                        // thread.spawn(fn, ...args) — emit the (argc, SageValue[]) form
+                        // its synchronous wrapper expects.
+                        if (strcmp(_mod_raw,"thread")==0 &&
+                            (int)ge->as.get.property.length==5 &&
+                            memcmp(ge->as.get.property.start,"spawn",5)==0) {
+                            size_t _ssz=96; for(int _ai=0;_ai<argc;_ai++){char*_ta=aot_expr_boxed(aot,expr->as.call.args[_ai]);_ssz+=strlen(_ta)+8;free(_ta);}
+                            char* _so=malloc(_ssz);
+                            int _sp=sprintf(_so,"sg_thread_sg_spawn(%d,(SageValue[]){",argc);
+                            if(argc==0) _sp+=sprintf(_so+_sp,"sage_rt_nil()");
+                            for(int _ai=0;_ai<argc;_ai++){char*_ta=aot_expr_boxed(aot,expr->as.call.args[_ai]);_sp+=sprintf(_so+_sp,"%s%s",_ai?",":"",_ta);free(_ta);}
+                            sprintf(_so+_sp,"})");
+                            free(_mobj_raw);
+                            return _so;
+                        }
+                        // Look up the full C prefix for this short module name
+                        const char* _full_pfx = NULL;
+                        for (int _pmi=0; _pmi<aot->mod_prefix_map_count; _pmi++) {
+                            if (strcmp(aot->mod_prefix_map[_pmi].short_name, _mod_raw)==0) {
+                                _full_pfx = aot->mod_prefix_map[_pmi].full_prefix; break;
+                            }
+                        }
                         char* _fn_c = aot_cname(ge->as.get.property.start, ge->as.get.property.length);
-                        size_t _msz = strlen(_mod_raw)+strlen(_fn_c)+64;
+                        size_t _msz = 64;
+                        if (_full_pfx) _msz += strlen(_full_pfx)+strlen(_fn_c);
+                        else _msz += strlen(_mod_raw)+strlen(_fn_c)+8;
                         for(int _ai=0;_ai<argc;_ai++){char*_ta=aot_expr(aot,expr->as.call.args[_ai],JIT_TYPE_UNKNOWN);_msz+=strlen(_ta)+8;free(_ta);}
                         char* _mout = malloc(_msz);
-                        // Direct C call: sg_MOD_sg_FUNC(arg0, arg1, ...)
-                        int _mp = snprintf(_mout, _msz, "sg_%s_%s(", _mod_raw, _fn_c);
+                        // Direct C call using full prefix: sg_std_atomic_sg_cas(args)
+                        // full_pfx ends with _ and fn_c starts with sg_: prefix+fn_c = "sg_arrays_sg_"+sg_sort = sg_arrays_sg_sg_sort
+                        // This matches the module compilation naming convention (mod_prefix + cname)
+                        int _mp;
+                        if (_full_pfx)
+                            _mp = snprintf(_mout, _msz, "%s%s(", _full_pfx, _fn_c);
+                        else
+                            _mp = snprintf(_mout, _msz, "sg_%s_%s(", _mod_raw, _fn_c);
                         for(int _ai=0;_ai<argc;_ai++){
-                            char*_ta=aot_expr(aot,expr->as.call.args[_ai],JIT_TYPE_UNKNOWN);
+                            char*_ta=aot_expr_boxed(aot,expr->as.call.args[_ai]);
                             _mp+=sprintf(_mout+_mp, "%s%s", _ai?",":"", _ta);
                             free(_ta);
                         }
@@ -1282,7 +1682,22 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
                 if ((!strcmp(_mn,"index_of")||!strcmp(_mn,"indexOf"))&&argc==1){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);size_t _cs=strlen(_mobj)+strlen(a)+256;char*o=malloc(_cs);snprintf(o,_cs,"sage_rt_array_index_of(%s,%s)",_mobj,a);free(_mobj);free(_mn);free(a);return o;}
                 if (!strcmp(_mn,"reverse")&&argc==0){size_t _cs=strlen(_mobj)+256;char*o=malloc(_cs);snprintf(o,_cs,"sage_rt_array_reverse(%s)",_mobj);free(_mobj);free(_mn);return o;}
                 if (!strcmp(_mn,"sort")&&argc==0){size_t _cs=strlen(_mobj)+256;char*o=malloc(_cs);snprintf(o,_cs,"sage_rt_array_sort(%s)",_mobj);free(_mobj);free(_mn);return o;}
-                if (!strcmp(_mn,"slice")&&argc==2){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_INT);char*b=aot_expr(aot,expr->as.call.args[1],JIT_TYPE_INT);size_t _cs=strlen(_mobj)+strlen(a)+strlen(b)+256;char*o=malloc(_cs);snprintf(o,_cs,"sage_rt_array_slice(%s,(int)(%s),(int)(%s))",_mobj,a,b);free(_mobj);free(_mn);free(a);free(b);return o;}
+                if (!strcmp(_mn,"slice")&&argc==2){
+                    char*a_raw=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_INT);
+                    char*b_raw=aot_expr(aot,expr->as.call.args[1],JIT_TYPE_INT);
+                    JitTypeTag at2=aot_infer_expr(aot,expr->as.call.args[0]);
+                    JitTypeTag bt2=aot_infer_expr(aot,expr->as.call.args[1]);
+                    char *a2, *b2;
+                    if (at2==JIT_TYPE_UNKNOWN||strncmp(a_raw,"sage_rt_",8)==0) {
+                        a2=malloc(strlen(a_raw)+32); sprintf(a2,"(int)SAGE_AS_INT64(%s)",a_raw); free(a_raw);
+                    } else a2=a_raw;
+                    if (bt2==JIT_TYPE_UNKNOWN||strncmp(b_raw,"sage_rt_",8)==0) {
+                        b2=malloc(strlen(b_raw)+32); sprintf(b2,"(int)SAGE_AS_INT64(%s)",b_raw); free(b_raw);
+                    } else b2=b_raw;
+                    size_t _cs=strlen(_mobj)+strlen(a2)+strlen(b2)+64;
+                    char*o=malloc(_cs); snprintf(o,_cs,"sage_rt_array_slice(%s,%s,%s)",_mobj,a2,b2);
+                    free(_mobj);free(_mn);free(a2);free(b2);return o;
+                }
                 if ((!strcmp(_mn,"get_or")||!strcmp(_mn,"get"))&&argc==2){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*b=aot_expr(aot,expr->as.call.args[1],JIT_TYPE_UNKNOWN);size_t _cs=strlen(_mobj)+strlen(a)+strlen(b)+256;char*o=malloc(_cs);snprintf(o,_cs,"sage_rt_dict_get_or(%s,%s,%s)",_mobj,a,b);free(_mobj);free(_mn);free(a);free(b);return o;}
                 if (!strcmp(_mn,"keys")&&argc==0)       _MO0("sage_rt_dict_keys");
                 if (!strcmp(_mn,"values")&&argc==0)     _MO0("sage_rt_dict_values");
@@ -1292,13 +1707,17 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
                 if (!strcmp(_mn,"get")&&argc==1){ char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);size_t _cs=strlen(_mobj)+strlen(a)+256;char*o=malloc(_cs);snprintf(o,_cs,"sage_rt_dict_get(%s,%s)",_mobj,a);free(_mobj);free(_mn);free(a);return o;}
                 if (!strcmp(_mn,"contains")&&argc==1){
                     JitTypeTag _cot=aot_infer_expr(aot,ge->as.get.object);
-                    char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);
-                    size_t _csz=strlen(_mobj)+strlen(a)+256;
+                    char*a=aot_expr_boxed(aot,expr->as.call.args[0]);
+                    size_t _csz=strlen(_mobj)*3+strlen(a)*2+256;
                     char*o=malloc(_csz);
-                    if(_cot==JIT_TYPE_ARRAY)
+                    if(_cot==JIT_TYPE_ARRAY||_cot==JIT_TYPE_DICT)
                         snprintf(o,_csz,"sage_rt_array_contains(%s,%s)",_mobj,a);
-                    else
+                    else if(_cot==JIT_TYPE_STRING)
                         snprintf(o,_csz,"sage_rt_bool(sage_rt_str_find(%s,%s).as.integer>=0)",_mobj,a);
+                    else
+                        // Unknown object type: dispatch at runtime — string uses find,
+                        // anything else (arrays) uses array_contains.
+                        snprintf(o,_csz,"(SAGE_IS_STRING(%s)?sage_rt_bool(sage_rt_str_find(%s,%s).as.integer>=0):sage_rt_array_contains(%s,%s))",_mobj,_mobj,a,_mobj,a);
                     free(_mobj);free(_mn);free(a);return o;
                 }
                 if (!strcmp(_mn,"replace")&&argc==2){char*a=aot_expr(aot,expr->as.call.args[0],JIT_TYPE_UNKNOWN);char*b=aot_expr(aot,expr->as.call.args[1],JIT_TYPE_UNKNOWN);size_t _cs=strlen(_mobj)+strlen(a)+strlen(b)+256;char*o=malloc(_cs);snprintf(o,_cs,"sage_rt_str_replace(%s,%s,%s)",_mobj,a,b);free(_mobj);free(_mn);free(a);free(b);return o;}
@@ -1308,32 +1727,56 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
                 #undef _MO1
                 #undef _MOUT
                 /* _mbufsz is a local var, not a macro */
-                // Generic method call via runtime
-                size_t total=strlen(_mobj)+strlen(_mn)+128;
+                // Generic method call via runtime. If the receiver is a wrapped
+                // Python object at runtime, dispatch to the Python FFI instead
+                // (handles math.sqrt(x), json.loads(s), etc.). The object is
+                // evaluated once into a temp to avoid double side effects.
+                size_t total=strlen(_mobj)+strlen(_mn)+256;
                 for(int i=0;i<argc;i++){char*a=aot_expr(aot,expr->as.call.args[i],JIT_TYPE_UNKNOWN);total+=strlen(a)+4;free(a);}
                 char* out=malloc(total);
-                int pos=0;
+                char* argbuf=NULL;
                 if(argc>0){
                     char** aa=malloc(argc*sizeof(char*));
                     size_t al=32;
-                    for(int i=0;i<argc;i++){aa[i]=aot_expr(aot,expr->as.call.args[i],JIT_TYPE_UNKNOWN);al+=strlen(aa[i])+4;}
-                    char*argbuf=malloc(al);
+                    for(int i=0;i<argc;i++){aa[i]=aot_expr_boxed(aot,expr->as.call.args[i]);al+=strlen(aa[i])+4;}
+                    argbuf=malloc(al);
                     int ap=sprintf(argbuf,"(SageValue[]){");
                     for(int i=0;i<argc;i++) ap+=sprintf(argbuf+ap,"%s%s",i?",":"",aa[i]);
                     sprintf(argbuf+ap,"}");
                     for(int i=0;i<argc;i++) free(aa[i]); free(aa);
-                    pos=sprintf(out,"sage_rt_method_call(%s,\"%s\",%d,%s)",_mobj,_mn,argc,argbuf);
-                    free(argbuf);
-                } else {
-                    pos=sprintf(out,"sage_rt_method_call(%s,\"%s\",0,NULL)",_mobj,_mn);
                 }
-                (void)pos;
+                if(argc>0)
+                    sprintf(out,"({SageValue _mo=%s; sage_rt_py_is_obj(_mo)?sage_rt_py_method(_mo,\"%s\",%d,%s):sage_rt_method_call(_mo,\"%s\",%d,%s);})",
+                            _mobj,_mn,argc,argbuf,_mn,argc,argbuf);
+                else
+                    sprintf(out,"({SageValue _mo=%s; sage_rt_py_is_obj(_mo)?sage_rt_py_method(_mo,\"%s\",0,NULL):sage_rt_method_call(_mo,\"%s\",0,NULL);})",
+                            _mobj,_mn,_mn);
+                if(argbuf)free(argbuf);
                 if(_mobj!=_mobj_raw)free(_mobj_raw); free(_mobj); free(_mn); return out;
             }
-            char* callee=aot_expr(aot,expr->as.call.callee,JIT_TYPE_UNKNOWN);
-            char* out=malloc(strlen(callee)+64);
-            sprintf(out,"sage_rt_nil()/*dyn-call*/");
-            free(callee); return out;
+            // Callee is an arbitrary expression (e.g. d["fn"](x), arr[0](x),
+            // (cond ? f : g)(x)). Evaluate it to a SageValue function and call it.
+            {
+                char* callee = aot_expr_boxed(aot, expr->as.call.callee);
+                size_t bufsz = strlen(callee) + 64;
+                char* argbuf = NULL;
+                if (argc > 0) {
+                    size_t asz = 16;
+                    char** av = malloc(sizeof(char*) * argc);
+                    for (int i = 0; i < argc; i++) { av[i] = aot_expr_boxed(aot, expr->as.call.args[i]); asz += strlen(av[i]) + 4; }
+                    argbuf = malloc(asz);
+                    int p = sprintf(argbuf, "(SageValue[]){");
+                    for (int i = 0; i < argc; i++) { p += sprintf(argbuf + p, "%s%s", i?",":"", av[i]); free(av[i]); }
+                    sprintf(argbuf + p, "}");
+                    free(av);
+                    bufsz += strlen(argbuf);
+                }
+                char* out = malloc(bufsz);
+                if (argc > 0) sprintf(out, "sage_rt_call_fn(%s,%d,%s)", callee, argc, argbuf);
+                else          sprintf(out, "sage_rt_call_fn(%s,0,NULL)", callee);
+                free(callee); if (argbuf) free(argbuf);
+                return out;
+            }
         }
 
         case EXPR_INTERP: {
@@ -1405,6 +1848,26 @@ static char* aot_expr(AotCompiler* aot, Expr* expr, JitTypeTag hint) {
                     lexer_set_state(sl);
                     parser_set_state(sp);
                     if (sub) {
+                        // Mirror the interpreter: if the inner expression is a bare
+                        // variable that isn't in scope, it would throw at runtime and
+                        // the interpreter preserves the literal "{name}" text. Do the
+                        // same here instead of emitting a reference to an undeclared C
+                        // variable (which fails to compile).
+                        if (sub->type == EXPR_VARIABLE) {
+                            char vn[256];
+                            int vl = sub->as.variable.name.length < 255 ? sub->as.variable.name.length : 255;
+                            memcpy(vn, sub->as.variable.name.start, vl); vn[vl] = '\0';
+                            if (!aot_var_in_scope(aot, vn) &&
+                                !aot_is_known_proc(aot, vn, vl)) {
+                                char* esc = aot_escape(parts[pi].s);
+                                compiled[pi] = malloc(strlen(esc) + 40);
+                                sprintf(compiled[pi], "sage_rt_string(\"{%s}\")", esc);
+                                free(esc);
+                                free(snip);
+                                free(parts[pi].s);
+                                continue;
+                            }
+                        }
                         // Always get a boxed SageValue for the sub-expression.
                         // aot_expr with UNKNOWN hint returns raw scalars for unboxed vars,
                         // so check inferred type and box explicitly if needed.
@@ -1513,9 +1976,14 @@ static char* compile_cond(AotCompiler* aot, Expr* expr) {
         if (vt==JIT_TYPE_BOOL||vt==JIT_TYPE_INT) return aot_expr(aot, expr, vt);
     }
     // Everything else: evaluate as SageValue, test with sage_rt_truthy
+    JitTypeTag raw_t = aot_infer_expr(aot, expr);
     char* raw = aot_expr(aot, expr, JIT_TYPE_UNKNOWN);
-    char* out = malloc(strlen(raw)+32);
-    sprintf(out, "sage_rt_truthy(%s)", raw);
+    // sage_rt_truthy expects SageValue — box if it's a raw scalar
+    char* boxed_raw = (jit_is_unboxed(raw_t) && strncmp(raw,"sage_rt_",8)!=0)
+        ? aot_box(raw_t, raw) : raw;
+    char* out = malloc(strlen(boxed_raw)+32);
+    sprintf(out, "sage_rt_truthy(%s)", boxed_raw);
+    if (boxed_raw != raw) { free(boxed_raw); }
     free(raw); return out;
 }
 
@@ -1523,41 +1991,134 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
     if (!stmt) return;
     switch (stmt->type) {
         case STMT_PRINT: {
-            // aot_expr(..., UNKNOWN) returns a raw C scalar only for bare EXPR_VARIABLE
-            // with a known unboxed type. Everything else already comes back as SageValue.
             Expr* _pe = stmt->as.print.expression;
-            JitTypeTag pt = aot_infer_expr(aot, _pe);
-            char* val = aot_expr(aot, _pe, JIT_TYPE_UNKNOWN);
-            if (jit_is_unboxed(pt) && _pe && _pe->type == EXPR_VARIABLE) {
-                char* boxed = aot_box(pt, val);
-                aot_emit(aot, "sage_rt_println(%s);", boxed);
-                free(boxed);
-            } else {
-                aot_emit(aot, "sage_rt_println(%s);", val);
+            // Mirror the interpreter's REPL-style recovery for the specific
+            // malformed pattern `print(<module>.<undefined-member> ...)`:
+            // accessing a member that the module doesn't define is a runtime
+            // error that goes to stderr, abandoning the statement (so nothing
+            // reaches stdout) while execution continues. We detect it at compile
+            // time by walking to the head module GET of the print argument.
+            {
+                Expr* head = _pe;
+                while (head) {
+                    if (head->type == EXPR_GET) { head = head->as.get.object; continue; }
+                    if (head->type == EXPR_INDEX) { head = head->as.index.array; continue; }
+                    if (head->type == EXPR_CALL) { head = head->as.call.callee; continue; }
+                    break;
+                }
+                // head should now be `module.member` as an EXPR_GET on a VARIABLE
+                if (_pe->type == EXPR_GET && _pe->as.get.object &&
+                    _pe->as.get.object->type == EXPR_GET) {
+                    Expr* mg = _pe->as.get.object;  // e.g. channel.q
+                    if (mg->as.get.object && mg->as.get.object->type == EXPR_VARIABLE) {
+                        char mod[128]; int ml = mg->as.get.object->as.variable.name.length;
+                        if (ml < 128) {
+                            memcpy(mod, mg->as.get.object->as.variable.name.start, ml); mod[ml]='\0';
+                            int is_mod = 0;
+                            for (int i=0;i<aot->imported_module_count;i++)
+                                if (!strcmp(aot->imported_modules[i],mod)) { is_mod=1; break; }
+                            if (is_mod) {
+                                // Is `member` a known function/var of this module?
+                                char mem[128]; int el = mg->as.get.property.length;
+                                if (el < 128) {
+                                    memcpy(mem, mg->as.get.property.start, el); mem[el]='\0';
+                                    int known = 0;
+                                    char want[256]; snprintf(want,sizeof(want),"sg_%s_sg_%s",mod,mem);
+                                    if (aot_is_known_proc(aot, want, (int)strlen(want))) known=1;
+                                    for (int i=0;!known && i<aot->mod_proc_count;i++)
+                                        if (!strcmp(aot->mod_procs[i].proc_raw,mem)) { known=1; break; }
+                                    if (!known) {
+                                        aot_emit(aot,"fprintf(stderr,\"Runtime Error: Module attribute is not defined.\\n\");");
+                                        break;  // skip the stdout print entirely
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
+            char* val = aot_expr_boxed(aot, _pe);
+            // Use sage_rt_print_kw which dispatches __str__ like the interpreter's STMT_PRINT
+            aot_emit(aot, "sage_rt_print_kw(%s);", val);
             free(val); break;
         }
         case STMT_LET: {
-            char* name=aot_cname_tok(stmt->as.let.name);
+            char* name_raw = aot_cname_tok(stmt->as.let.name);
+            // Determine the var's actual name (without sg_ prefix) for type_env
+            char let_raw[256]; int lrl = stmt->as.let.name.length < 255 ? stmt->as.let.name.length : 255;
+            memcpy(let_raw, stmt->as.let.name.start, lrl); let_raw[lrl] = '\0';
+            // Check if this var was pre-declared as a file-scope global
+            // (happens for top-level vars that need to be visible in class methods)
+            // Only applies in top-level code (not inside proc/method bodies which
+            // should declare their own locals even if the name matches a global)
+            int _is_global = 0;
+            if (!aot->in_proc_body) {
+                for (int _gi = 0; _gi < aot->global_var_count; _gi++)
+                    if (strcmp(aot->global_vars[_gi], name_raw) == 0) { _is_global = 1; break; }
+            }
+            if (_is_global) {
+                // Already declared as static SageValue — just assign (always boxed)
+                if (stmt->as.let.initializer) {
+                    char* val = aot_expr_boxed(aot, stmt->as.let.initializer);
+                    aot_emit(aot, "%s = %s;", name_raw, val); free(val);
+                }
+                // Register as UNKNOWN so references don't try to unbox it
+                aot_set_var_type(aot, let_raw, JIT_TYPE_UNKNOWN);
+                free(name_raw); break;
+            }
             if (stmt->as.let.initializer) {
-                // Inside a coroutine body all variables must be SageValue — params arrive
-                // from _co->argv[] as SageValue, so specialisation would cause type mismatches.
                 JitTypeTag t = aot->in_coro_body ? JIT_TYPE_UNKNOWN
                                                  : aot_infer_expr(aot, stmt->as.let.initializer);
+                // Register type in type_env so future references know the C type.
+                // Inside proc bodies: force-set to shadow outer-scope UNKNOWN entries
+                // (e.g. global pre-scan sets outer x→UNKNOWN, inner proc's x→STRING wins)
+                if (aot->in_proc_body) aot_force_var_type(aot, let_raw, t);
+                else aot_set_var_type(aot, let_raw, t);
+                // If inside a closure body that has #define capture aliases,
+                // undef this name before declaring local — prevents macro expansion conflict.
+                // Safe even when no such #define exists (no-op undef).
+                // Only do this inside closure wrappers (in_closure_body > 0) to avoid
+                // polluting global/proc scope with gratuitous undefs.
+                if (aot->in_closure_body)
+                    aot_emit(aot,"#undef %s", name_raw);
                 if (jit_is_unboxed(t)) {
                     char* val=aot_expr(aot,stmt->as.let.initializer,t);
-                    aot_emit(aot,"%s %s = %s;",jit_ctype(t),name,val); free(val);
+                    // aot_expr may return a boxed SageValue even with an unboxed hint
+                    // (e.g. `(b1 & 128) != 0` where operands are SageValue → returns
+                    // sage_rt_bool(...)). If the declared C type is a raw scalar but the
+                    // RHS is a boxed sage_rt_* expression that doesn't already end in a
+                    // field extraction, extract the matching field.
+                    size_t vl = strlen(val);
+                    int ends_in_field =
+                        (vl>=11 && strcmp(val+vl-11,".as.integer")==0) ||
+                        (vl>=10 && strcmp(val+vl-10,".as.number")==0)  ||
+                        (vl>=11 && strcmp(val+vl-11,".as.boolean")==0) ||
+                        (vl>=10 && strcmp(val+vl-10,".as.string")==0);
+                    int rhs_is_boxed = (strncmp(val,"sage_rt_",8)==0) && !ends_in_field;
+                    if (rhs_is_boxed) {
+                        const char* fld = (t==JIT_TYPE_INT)?"i":(t==JIT_TYPE_FLOAT)?"d":
+                                          (t==JIT_TYPE_BOOL)?".as.boolean":
+                                          (t==JIT_TYPE_STRING)?".as.string":"";
+                        if (t==JIT_TYPE_INT)
+                            aot_emit(aot,"%s %s = SAGE_AS_INT64(%s);",jit_ctype(t),name_raw,val);
+                        else if (t==JIT_TYPE_FLOAT)
+                            aot_emit(aot,"%s %s = SAGE_AS_DOUBLE(%s);",jit_ctype(t),name_raw,val);
+                        else
+                            aot_emit(aot,"%s %s = (%s)%s;",jit_ctype(t),name_raw,val,fld);
+                    } else {
+                        aot_emit(aot,"%s %s = %s;",jit_ctype(t),name_raw,val);
+                    }
+                    free(val);
                 } else if (t == JIT_TYPE_STRUCT &&
                            stmt->as.let.initializer->type == EXPR_VARIABLE) {
-                    // Struct copy on assign — value semantics
                     char* val=aot_expr(aot,stmt->as.let.initializer,JIT_TYPE_UNKNOWN);
-                    aot_emit(aot,"SageValue %s = sage_rt_struct_copy(%s);",name,val); free(val);
+                    aot_emit(aot,"SageValue %s = sage_rt_struct_copy(%s);",name_raw,val); free(val);
                 } else {
-                    char* val=aot_expr(aot,stmt->as.let.initializer,JIT_TYPE_UNKNOWN);
-                    aot_emit(aot,"SageValue %s = %s;",name,val); free(val);
+                    char* val=aot_expr_boxed(aot,stmt->as.let.initializer);
+                    aot_emit(aot,"SageValue %s = %s;",name_raw,val); free(val);
                 }
-            } else aot_emit(aot,"SageValue %s = sage_rt_nil();",name);
-            free(name); break;
+            } else aot_emit(aot,"SageValue %s = sage_rt_nil();",name_raw);
+            free(name_raw); break;
         }
         case STMT_EXPRESSION: {
             Expr* e = stmt->as.expression;
@@ -1584,28 +2145,46 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
                         (e->as.set.value->type == EXPR_INT   && vt == JIT_TYPE_INT)   ||
                         (e->as.set.value->type == EXPR_NUMBER&& vt == JIT_TYPE_FLOAT) ||
                         (e->as.set.value->type == EXPR_BOOL  && vt == JIT_TYPE_BOOL)  ||
-                        (e->as.set.value->type == EXPR_STRING&& vt == JIT_TYPE_STRING)||
-                        (e->as.set.value->type == EXPR_BINARY && jit_is_unboxed(rhs_t) && rhs_t == vt)
+                        // Binary numeric ops return raw ONLY when the C expression is truly raw
+                        // (not when they've been boxed as sage_rt_int(...) because hint=UNKNOWN)
+                        (e->as.set.value->type == EXPR_BINARY && jit_is_unboxed(rhs_t) && rhs_t == vt &&
+                         rhs_t != JIT_TYPE_STRING && strncmp(rhs,"sage_rt_",8)!=0)
                     );
                     if (rhs_is_raw) {
                         aot_emit(aot, "%s = %s;", lhs, rhs);
                     } else {
                         // RHS returns SageValue — extract the right field
-                        char* extract = malloc(strlen(rhs) + 64);
-                        switch(vt) {
-                            case JIT_TYPE_INT:
-                                sprintf(extract, "(%s).as.integer", rhs); break;
-                            case JIT_TYPE_FLOAT:
-                                sprintf(extract, "(%s).as.number", rhs); break;
-                            case JIT_TYPE_BOOL:
-                                sprintf(extract, "(%s).as.boolean", rhs); break;
-                            case JIT_TYPE_STRING:
-                                sprintf(extract, "(%s).as.string", rhs); break;
-                            default:
-                                sprintf(extract, "%s", rhs); break;
+                        // rhs_looks_raw: true if rhs is a raw C scalar (not SageValue)
+                        // Function calls and sage_rt_* expressions always return SageValue
+                        // even when the inferred type is unboxed (e.g. STRING method calls)
+                        int _rhs_is_call = (e->as.set.value->type == EXPR_CALL ||
+                                            strncmp(rhs,"sage_rt_",8)==0 ||
+                                            strncmp(rhs,"({",2)==0 ||
+                                            rhs[0]=='(' || // (sage_rt_add(...)) pattern
+                                            (e->as.set.value->type == EXPR_BINARY && rhs_t == JIT_TYPE_STRING));
+                        int rhs_looks_raw = (jit_is_unboxed(rhs_t) && !_rhs_is_call);
+                        if (rhs_looks_raw) {
+                            // Already a raw scalar — direct assign
+                            aot_emit(aot, "%s = %s;", lhs, rhs);
+                        } else {
+                            char* extract = malloc(strlen(rhs) + 64);
+                            switch(vt) {
+                                case JIT_TYPE_INT:
+                                    // SAGE_AS_INT64 converts float→int correctly; raw
+                                    // .as.integer would type-pun a float's bits.
+                                    sprintf(extract, "SAGE_AS_INT64(%s)", rhs); break;
+                                case JIT_TYPE_FLOAT:
+                                    sprintf(extract, "SAGE_AS_DOUBLE(%s)", rhs); break;
+                                case JIT_TYPE_BOOL:
+                                    sprintf(extract, "(%s).as.boolean", rhs); break;
+                                case JIT_TYPE_STRING:
+                                    sprintf(extract, "(%s).as.string", rhs); break;
+                                default:
+                                    sprintf(extract, "%s", rhs); break;
+                            }
+                            aot_emit(aot, "%s = %s;", lhs, extract);
+                            free(extract);
                         }
-                        aot_emit(aot, "%s = %s;", lhs, extract);
-                        free(extract);
                     }
                     free(lhs); free(rhs); break;
                 }
@@ -1639,12 +2218,31 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
             char* var=aot_cname_tok(stmt->as.for_stmt.variable);
             Expr*lo=NULL,*hi=NULL; int inc=0;
             if (is_range_for(stmt,&lo,&hi,&inc)) {
-                // Register loop var as INT so body can use it unboxed
+                // Force register loop var as INT — override any prior UNKNOWN inference
                 { char name[256]; int len=stmt->as.for_stmt.variable.length<255?stmt->as.for_stmt.variable.length:255;
                   memcpy(name,stmt->as.for_stmt.variable.start,len);name[len]='\0';
-                  aot_set_var_type(aot,name,JIT_TYPE_INT); }
-                char* lo_c=lo?aot_expr(aot,lo,JIT_TYPE_INT):strdup("INT64_C(0)");
-                char* hi_c=aot_expr(aot,hi,JIT_TYPE_INT);
+                  aot_force_var_type(aot,name,JIT_TYPE_INT); }
+                char* lo_c_raw=lo?aot_expr(aot,lo,JIT_TYPE_INT):strdup("INT64_C(0)");
+                JitTypeTag lo_t = lo ? aot_infer_expr(aot, lo) : JIT_TYPE_INT;
+                char* lo_c;
+                if (lo && (lo_t==JIT_TYPE_UNKNOWN || strncmp(lo_c_raw,"sage_rt_",8)==0)) {
+                    lo_c = malloc(strlen(lo_c_raw)+32);
+                    sprintf(lo_c,"(int64_t)SAGE_AS_INT64(%s)",lo_c_raw);
+                    free(lo_c_raw);
+                } else { lo_c = lo_c_raw; }
+                char* hi_c_raw=aot_expr(aot,hi,JIT_TYPE_INT);
+                // If hi_c is a SageValue expression (starts with sage_rt_) or 
+                // a SageValue variable (UNKNOWN inferred type), unbox it
+                JitTypeTag hi_t = aot_infer_expr(aot, hi);
+                char* hi_c;
+                if (hi_t == JIT_TYPE_UNKNOWN || hi_t == JIT_TYPE_INSTANCE ||
+                    strncmp(hi_c_raw,"sage_rt_",8)==0 || strncmp(hi_c_raw,"({",2)==0) {
+                    hi_c = malloc(strlen(hi_c_raw)+32);
+                    sprintf(hi_c,"(int64_t)SAGE_AS_INT64(%s)",hi_c_raw);
+                    free(hi_c_raw);
+                } else {
+                    hi_c = hi_c_raw;
+                }
                 const char* cmp=inc?"<=":"<";
                 aot_emit(aot,"for (int64_t %s = %s; %s %s %s; %s++) {",var,lo_c,var,cmp,hi_c,var);
                 free(lo_c); free(hi_c);
@@ -1660,7 +2258,18 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
                 aot_emit(aot,"for (int64_t %s = 0; %s < sage_rt_array_len(%s); %s++) {",idx,idx,iter,idx);
                 aot->indent++;
                 aot_emit(aot,"SageValue %s = sage_rt_array_get(%s, sage_rt_int(%s));",var,iter,idx);
+                // The loop variable is a fresh SageValue binding for the body. Force
+                // its type to UNKNOWN so any stale outer inference (e.g. an outer
+                // `var item = "..."`) doesn't mis-specialize uses inside the loop.
+                // Save and restore around the body so the outer type is unaffected.
+                char loopname[256];
+                { int len=stmt->as.for_stmt.variable.length<255?stmt->as.for_stmt.variable.length:255;
+                  memcpy(loopname,stmt->as.for_stmt.variable.start,len);loopname[len]='\0'; }
+                JitTypeTag _saved_lt = aot_get_var_type(aot, loopname);
+                int _was_in_scope = aot_var_in_scope(aot, loopname);
+                aot_force_var_type(aot, loopname, JIT_TYPE_UNKNOWN);
                 for(Stmt*s=stmt->as.for_stmt.body;s;s=s->next) aot_compile_stmt(aot,s);
+                if (_was_in_scope) aot_force_var_type(aot, loopname, _saved_lt);
                 aot->indent--;
                 aot_emit(aot,"}"); aot->indent--;
                 aot_emit(aot,"}");
@@ -1677,15 +2286,17 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
                 aot->indent--; aot_emit(aot,"}");
             }
             if (stmt->as.ret.value) {
-                JitTypeTag rt = aot_infer_expr(aot, stmt->as.ret.value);
-                char* val = aot_expr(aot, stmt->as.ret.value, JIT_TYPE_UNKNOWN);
-                if (jit_is_unboxed(rt) && stmt->as.ret.value->type == EXPR_VARIABLE) {
-                    char* boxed = aot_box(rt, val);
-                    aot_emit(aot, "return %s;", boxed);
-                    free(boxed);
+                // Always box the return value — all Sage procs return SageValue
+                // But: in closure bodies, captured variables are SageValue via _caps->fields[N]
+                // so we must NOT use the outer-inferred type for boxing
+                char* val;
+                if (aot->in_closure_body && stmt->as.ret.value->type == EXPR_VARIABLE) {
+                    // Return captured var directly — it's already SageValue in the closure
+                    val = aot_expr(aot, stmt->as.ret.value, JIT_TYPE_UNKNOWN);
                 } else {
-                    aot_emit(aot, "return %s;", val);
+                    val = aot_expr_boxed(aot, stmt->as.ret.value);
                 }
+                aot_emit(aot, "return %s;", val);
                 free(val);
             } else aot_emit(aot,"return sage_rt_nil();");
             break;
@@ -1693,9 +2304,10 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
         case STMT_BREAK:    aot_emit(aot,"break;");    break;
         case STMT_CONTINUE: aot_emit(aot,"continue;"); break;
         case STMT_BLOCK:
-            aot_emit(aot,"{"); aot->indent++;
+            // Compile block statements inline without C braces — keeps vars in scope.
+            // Sage blocks from destructuring need outer-scope visibility.
             for(Stmt*s=stmt->as.block.statements;s;s=s->next) aot_compile_stmt(aot,s);
-            aot->indent--; aot_emit(aot,"}"); break;
+            break;
         case STMT_ANNOTATED_BLOCK: {
             BlockAnnotation ann=stmt->as.annotated_block.annotation;
             if (ann==BLOCK_ANNOT_MANUAL||ann==BLOCK_ANNOT_TRUSTED)
@@ -1728,6 +2340,7 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
                     if(!mc->pattern) has_range=1;
                     else if(mc->pattern->type==EXPR_RANGE) has_range=1;
                     else if(mc->pattern->type==EXPR_VARIABLE) has_range=1; // wildcard
+                    else if(mc->guard) has_range=1; // guard — can't use switch
                 }
                 if(!has_range){
                     // Pure integer switch
@@ -1753,15 +2366,20 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
                         const char*kw=(i==0)?"if":"} else if";
                         // Check for guard expression (case n if cond =>)
                         if(mc->guard){
-                            // Bind the pattern variable if it's a name pattern
-                            char*gcond=aot_expr(aot,mc->guard,JIT_TYPE_UNKNOWN);
-                            aot_emit(aot,"%s (sage_rt_truthy(%s)) {",kw,gcond);
-                            free(gcond); aot->indent++;
-                            // Bind pattern variable to match target
-                            if(mc->pattern && mc->pattern->type==EXPR_VARIABLE){
-                                char*pn=aot_cname_tok(mc->pattern->as.variable.name);
-                                aot_emit(aot,"int64_t %s=%s;",pn,tmp); free(pn);
+                            char*gcond=compile_cond(aot,mc->guard);
+                            if(mc->pattern && mc->pattern->type!=EXPR_VARIABLE){
+                                // Pattern + guard: if (val == pattern && guard_cond)
+                                char*pat=aot_expr(aot,mc->pattern,JIT_TYPE_INT);
+                                aot_emit(aot,"%s (%s==%s && %s) {",kw,tmp,pat,gcond);
+                                free(pat);
+                            } else {
+                                aot_emit(aot,"%s (%s) {",kw,gcond);
+                                if(mc->pattern && mc->pattern->type==EXPR_VARIABLE){
+                                    char*pn=aot_cname_tok(mc->pattern->as.variable.name);
+                                    aot_emit(aot,"int64_t %s=%s;",pn,tmp); free(pn);
+                                }
                             }
+                            free(gcond); aot->indent++;
                         } else if(!mc->pattern || (mc->pattern->type==EXPR_VARIABLE &&
                                 mc->pattern->as.variable.name.length==1 &&
                                 mc->pattern->as.variable.name.start[0]=='_')){
@@ -1959,6 +2577,7 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
             char* frame=aot_temp(aot);
             aot_emit(aot,"{ SageExcFrame %s;",frame); aot->indent++;
             aot_emit(aot,"%s.prev=sage_rt_exc_top; %s.active=1; sage_rt_exc_top=&%s;",frame,frame,frame);
+            aot_emit(aot,"%s.saved_depth=sage_rt_call_depth;",frame);
             aot_emit(aot,"if (setjmp(%s.jb)==0) {",frame); aot->indent++;
             for(Stmt*s=stmt->as.try_stmt.try_block;s;s=s->next) aot_compile_stmt(aot,s);
             aot->indent--; aot_emit(aot,"}");
@@ -1967,7 +2586,7 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
                 CatchClause*cc=stmt->as.try_stmt.catches[0];
                 char*excvar=aot_cname_tok(cc->exception_var);
                 aot_emit(aot,"if (!%s.active) {",frame); aot->indent++;
-                aot_emit(aot,"sage_rt_exc_top=%s.prev;",frame);
+                aot_emit(aot,"sage_rt_exc_top=%s.prev; sage_rt_call_depth=%s.saved_depth;",frame,frame);
                 // Store exc in a block-scoped var to survive optimization
                 aot_emit(aot,"{ SageValue %s=%s.exc;",excvar,frame);
                 for(Stmt*s=cc->body;s;s=s->next) aot_compile_stmt(aot,s);
@@ -1975,7 +2594,7 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
                 aot->indent--; aot_emit(aot,"} else { sage_rt_exc_top=%s.prev; }",frame);
                 free(excvar);
             } else {
-                aot_emit(aot,"sage_rt_exc_top=%s.prev;",frame);
+                aot_emit(aot,"sage_rt_exc_top=%s.prev; sage_rt_call_depth=%s.saved_depth;",frame,frame);
             }
             // Finally block always runs after catch
             if (stmt->as.try_stmt.finally_block){
@@ -2095,7 +2714,10 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
                     free(pn); pi++;
                 }
                 aot_infer_body(aot,m->as.proc.body);
+                int _saved_ipb = aot->in_proc_body;
+                aot->in_proc_body = 1;
                 for(Stmt*bs=m->as.proc.body;bs;bs=bs->next) aot_compile_stmt(aot,bs);
+                aot->in_proc_body = _saved_ipb;
                 aot_emit(aot,"return sage_rt_nil();"); aot->indent--; aot_emit(aot,"}");
                 free(mname);
             }
@@ -2247,25 +2869,342 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
             const char* mname = stmt->as.import.module_name;
             if (!mname) break;
             // Do not recursively process imports inside a module body
-            if (aot->in_module_body) break;
-            // Skip if already processed (imports are pre-compiled at file scope)
+            // (they would be emitted inside a function which is invalid C)
+            // Exception: _math is a native preamble module — always allow it
+            // Exception: regular modules already imported can be allowed (they're already compiled)
+            if (aot->in_module_body) {
+                if (strcmp(mname,"_math")!=0) {
+                    // Check if it's already imported — if so, nothing to emit (skip silently)
+                    int _already = 0;
+                    for (int _i=0; _i<aot->imported_module_count; _i++)
+                        if (strcmp(aot->imported_modules[_i], mname)==0) { _already=1; break; }
+                    if (_already) break;
+                    // Not imported yet: needs to be compiled at file scope — skip for now
+                    // (the outer scan should have caught it; if not, it's a nested import)
+                    break;
+                }
+            }
+            // Extract short name: "std.argparse" → "argparse" (last dotted component)
+            const char* short_name = strrchr(mname, '.');
+            short_name = short_name ? short_name + 1 : mname;
+            if (stmt->as.import.alias && stmt->as.import.alias[0])
+                short_name = stmt->as.import.alias;
+
+            // Check if already compiled
             int already2 = 0;
             for (int i=0; i<aot->imported_module_count; i++)
                 if (strcmp(aot->imported_modules[i], mname)==0) { already2=1; break; }
+
+            // Handle "from X import Y, Z" items for already-imported modules
+            // (for fresh imports, this is handled after module compilation below)
+            if (stmt->as.import.item_count > 0 && stmt->as.import.items && already2) {
+                const char* _full_pfx_early = NULL;
+                for (int _pmi=0; _pmi<aot->mod_prefix_map_count; _pmi++) {
+                    if (strcmp(aot->mod_prefix_map[_pmi].short_name, short_name)==0) {
+                        _full_pfx_early = aot->mod_prefix_map[_pmi].full_prefix; break;
+                    }
+                }
+                if (_full_pfx_early) {
+                    for (int _ii=0; _ii<stmt->as.import.item_count; _ii++) {
+                        const char* item = stmt->as.import.items[_ii];
+                        if (!item) continue;
+                        char* item_c = aot_cname(item, strlen(item));
+                        char pfx_fn2[256]; snprintf(pfx_fn2,sizeof(pfx_fn2),"%s%s",_full_pfx_early,item_c);
+                        if (strcmp(item_c, pfx_fn2) != 0) {
+                            aot_emit(aot, "#define %s %s", item_c, pfx_fn2);
+                            aot_register_proc(aot, item_c);
+                        }
+                        free(item_c);
+                    }
+                }
+            }
+
             if (already2) break;
-            // Already imported?
-            int already = 0;
-            for (int i=0; i<aot->imported_module_count; i++)
-                if (strcmp(aot->imported_modules[i], mname)==0) { already=1; break; }
-            if (already) break;
             // Record
             if (aot->imported_module_count < 64)
                 snprintf(aot->imported_modules[aot->imported_module_count++], 128, "%s", mname);
 
             // Resolve module path via global_module_cache
+            // But first: check if this is a force-stubbed module (e.g. thread.sage uses
+            // "spawn" which is a reserved keyword, causing parse failure)
+            {
+                static const char* _skip_sage[] = {
+                    "thread","atomic","channel","gc",NULL
+                };
+                int _should_skip = 0;
+                for(int _ki=0; _skip_sage[_ki]; _ki++)
+                    if(strcmp(mname,_skip_sage[_ki])==0){_should_skip=1;break;}
+                if(_should_skip){ break; }
+            }
             char* path = resolve_module_path(global_module_cache, mname);
             if (!path) {
-                aot_emit(aot, "/* import %s: not found, skipping */", mname);
+                // Special case: _math is a native interpreter module that maps to C <math.h>
+                // Emit real C wrappers and #define aliases for from _math import *
+                if (strcmp(mname, "_math") == 0) {
+                    static const struct { const char* fn; const char* c_expr; } _mfns[] = {
+                        {"sin",  "sage_rt_float(sin(sage_rt_to_float(_a)))"},
+                        {"cos",  "sage_rt_float(cos(sage_rt_to_float(_a)))"},
+                        {"tan",  "sage_rt_float(tan(sage_rt_to_float(_a)))"},
+                        {"asin", "sage_rt_float(asin(sage_rt_to_float(_a)))"},
+                        {"acos", "sage_rt_float(acos(sage_rt_to_float(_a)))"},
+                        {"atan", "sage_rt_float(atan(sage_rt_to_float(_a)))"},
+                        {"atan2","sage_rt_float(atan2(sage_rt_to_float(_a),sage_rt_to_float(_b)))"},
+                        {"sqrt", "sage_rt_float(sqrt(sage_rt_to_float(_a)))"},
+                        {"pow",  "sage_rt_float(pow(sage_rt_to_float(_a),sage_rt_to_float(_b)))"},
+                        {"log",  "sage_rt_float(log(sage_rt_to_float(_a)))"},
+                        {"log10","sage_rt_float(log10(sage_rt_to_float(_a)))"},
+                        {"exp",  "sage_rt_float(exp(sage_rt_to_float(_a)))"},
+                        {"floor","sage_rt_float(floor(sage_rt_to_float(_a)))"},
+                        {"ceil", "sage_rt_float(ceil(sage_rt_to_float(_a)))"},
+                        {"round","sage_rt_float(round(sage_rt_to_float(_a)))"},
+                        {"fmod", "sage_rt_float(fmod(sage_rt_to_float(_a),sage_rt_to_float(_b)))"},
+                        {"isnan","sage_rt_bool(isnan(sage_rt_to_float(_a)))"},
+                        {"isinf","sage_rt_bool(isinf(sage_rt_to_float(_a)))"},
+                        {NULL,NULL}
+                    };
+                    // Helper: sage_rt_to_float — extract double from SageValue
+                    aot_emit(aot,"static inline double sage_rt_to_float(SageValue v){");
+                    aot_emit(aot,"  if(v.type==SAGE_VAL_FLOAT)return v.as.number;");
+                    aot_emit(aot,"  if(v.type==SAGE_VAL_INT)return(double)v.as.integer;");
+                    aot_emit(aot,"  return 0.0;}");
+                    for (int _mi=0; _mfns[_mi].fn; _mi++) {
+                        const char* fn = _mfns[_mi].fn;
+                        const char* expr = _mfns[_mi].c_expr;
+                        int two_args = strstr(expr,"_b") != NULL;
+                        if (two_args)
+                            aot_emit(aot,"static SageValue sg__math_sg_%s(SageValue _a,SageValue _b){return %s;}",fn,expr);
+                        else
+                            aot_emit(aot,"static SageValue sg__math_sg_%s(SageValue _a){return %s;}",fn,expr);
+                        // #define alias: when math.sage (prefix sg_math_) uses from _math import *,
+                        // calls become sg_math_sg_sin — alias to our wrapper.
+                        // SKIP functions that math.sage redefines (sqrt, floor, ceil, round)
+                        // to avoid conflicting with its own sg_math_sg_sqrt etc.
+                        static const char* _math_sage_overrides[] = {"sqrt","floor","ceil","round",NULL};
+                        int _overridden = 0;
+                        for (int _oi=0; _math_sage_overrides[_oi]; _oi++)
+                            if (strcmp(fn, _math_sage_overrides[_oi])==0) { _overridden=1; break; }
+                        if (!_overridden)
+                            aot_emit(aot,"#define sg_math_sg_%s sg__math_sg_%s",fn,fn);
+                        aot_register_proc(aot, fn);
+                    }
+                    // Constants as #defines (accessed as sg_pi etc. inside math.sage)
+                    aot_emit(aot,"static SageValue _sg_math_pi = {0};");
+                    aot_emit(aot,"#define sg_pi _sg_math_pi");
+                    aot_emit(aot,"#define sg_math_sg_pi _sg_math_pi");
+                    aot_emit(aot,"static SageValue _sg_math_e_val = {0};");
+                    aot_emit(aot,"#define sg_e _sg_math_e_val");
+                    aot_emit(aot,"#define sg_math_sg_e _sg_math_e_val");
+                    aot_emit(aot,"static SageValue _sg_math_tau = {0};");
+                    aot_emit(aot,"#define sg_tau _sg_math_tau");
+                    aot_emit(aot,"#define sg_math_sg_tau _sg_math_tau");
+                    // Register mod_prefix_map so from-import aliases work
+                    if (aot->mod_prefix_map_count < 64) {
+                        snprintf(aot->mod_prefix_map[aot->mod_prefix_map_count].short_name,64,"_math");
+                        snprintf(aot->mod_prefix_map[aot->mod_prefix_map_count].full_prefix,128,"sg__math_sg_");
+                        aot->mod_prefix_map_count++;
+                    }
+                    // Register pi, e, tau in mod_procs so they get set in main() dict init
+                    // for math.pi / math.e / math.tau access via sage_rt_dict_get
+                    if (aot->mod_proc_count+4 < 512) {
+                        // Also initialize the static vars used inside math.sage procs
+                        struct { const char* raw; const char* val; } _consts[] = {
+                            {"pi","sage_rt_float(3.14159265358979323846)"},
+                            {"e","sage_rt_float(2.71828182845904523536)"},
+                            {"tau","sage_rt_float(6.28318530717958647692)"},
+                            {NULL,NULL}
+                        };
+                        for (int _ci=0; _consts[_ci].raw; _ci++) {
+                            snprintf(aot->mod_procs[aot->mod_proc_count].mod_cname,64,"sg_math");
+                            snprintf(aot->mod_procs[aot->mod_proc_count].proc_raw,64,"%s",_consts[_ci].raw);
+                            snprintf(aot->mod_procs[aot->mod_proc_count].wrap_cname,1024,"@@%s",_consts[_ci].val);
+                            aot->mod_proc_count++;
+                        }
+                    }
+                    break;
+                }
+                // Special case: string native module — map to sage_rt_str_* runtime functions
+                if (strcmp(mname, "string") == 0) {
+                    static const struct { const char* fn; const char* rt; int na; } _sfns[] = {
+                        {"find",       NULL,                     2},  // custom: returns float like interpreter
+                        {"rfind",      NULL,                     2},  // same as find
+                        {"startswith", "sage_rt_str_startswith", 2},
+                        {"endswith",   "sage_rt_str_endswith",   2},
+                        {"contains",   "sage_rt_str_startswith", 2},  // approximate
+                        {"reverse",    NULL,                     1},  // custom below
+                        {"repeat",     NULL,                     2},  // custom below (needs int arg)
+                        {NULL,NULL,0}
+                    };
+                    char _mcn_str[16]; snprintf(_mcn_str,sizeof(_mcn_str),"sg_string");
+                    aot_emit(aot,"static SageValue %s = {0};", _mcn_str);
+                    aot_set_var_type(aot, "string", JIT_TYPE_DICT);
+                    if (aot->mod_prefix_map_count < 64) {
+                        snprintf(aot->mod_prefix_map[aot->mod_prefix_map_count].short_name,64,"string");
+                        // Use sg_string_ prefix (fn_c adds sg_ so result = sg_string_sg_find)
+                        snprintf(aot->mod_prefix_map[aot->mod_prefix_map_count].full_prefix,128,"sg_string_");
+                        aot->mod_prefix_map_count++;
+                    }
+                    for (int _sfi=0; _sfns[_sfi].fn; _sfi++) {
+                        const char* fn = _sfns[_sfi].fn;
+                        char sfn[64]; snprintf(sfn,sizeof(sfn),"sg_string_sg_%s",fn);
+                        if (!_sfns[_sfi].rt) {
+                            if (strcmp(fn,"reverse")==0) {
+                                // Custom reverse: iterate chars
+                                aot_emit(aot,"static SageValue %s(SageValue _a){",sfn);
+                                aot_emit(aot,"  if(!SAGE_IS_STRING(_a))return _a;");
+                                aot_emit(aot,"  int _l=strlen(_a.as.string);char*_r=(char*)malloc(_l+1);");
+                                aot_emit(aot,"  for(int _i=0;_i<_l;_i++)_r[_i]=_a.as.string[_l-1-_i];_r[_l]=0;");
+                                aot_emit(aot,"  return sage_rt_string(_r);}");
+                            } else if (strcmp(fn,"find")==0||strcmp(fn,"rfind")==0) {
+                                // find returns float (like interpreter int-as-float)
+                                aot_emit(aot,"static SageValue %s(SageValue _a,SageValue _b){",sfn);
+                                aot_emit(aot,"  SageValue _r=sage_rt_str_find(_a,_b);");
+                                aot_emit(aot,"  return sage_rt_float((double)SAGE_AS_INT64(_r));}");
+                            } else { // repeat — needs int arg
+                                aot_emit(aot,"static SageValue %s(SageValue _a,SageValue _b){",sfn);
+                                aot_emit(aot,"  return sage_rt_str_repeat(_a,(int64_t)SAGE_AS_INT64(_b));}");
+                            }
+                        } else if (_sfns[_sfi].na==2) {
+                            aot_emit(aot,"static SageValue %s(SageValue _a,SageValue _b){return %s(_a,_b);}",sfn,_sfns[_sfi].rt);
+                        } else {
+                            aot_emit(aot,"static SageValue %s(SageValue _a){return %s(_a,sage_rt_nil());}",sfn,_sfns[_sfi].rt);
+                        }
+                        aot_register_proc(aot, sfn);
+                        if (aot->mod_proc_count < 512) {
+                            snprintf(aot->mod_procs[aot->mod_proc_count].mod_cname,64,"%s",_mcn_str);
+                            snprintf(aot->mod_procs[aot->mod_proc_count].proc_raw,64,"%s",fn);
+                            // Use single wrap (no @@) so dict init doesn't try to set static var
+                            snprintf(aot->mod_procs[aot->mod_proc_count].wrap_cname,1024,
+                                     "_mwrap_placeholder_%s",sfn);
+                            // Actually use the direct fn pointer emission format
+                            snprintf(aot->mod_procs[aot->mod_proc_count].wrap_cname,1024,"%s",sfn);
+                            aot->mod_proc_count++;
+                        }
+                    }
+                    break;
+                }
+                aot_emit(aot, "/* import %s: not found, using stubs */", mname);
+                // Emit nil-returning stubs for common module functions
+                // so module.method() calls compile even without real implementation
+                static const struct { const char* mod; const char* fn; int nargs; } _stubs[] = {
+                    {"thread","spawn",1},{"thread","join",1},{"thread","id",0},
+                    {"thread","sleep",1},{"thread","yield",0},{"thread","mutex",0},
+                    {"thread","lock",1},{"thread","unlock",1},{"thread","try_lock",1},
+                    {"semaphore","new",1},{"semaphore","wait",1},{"semaphore","signal",1},
+                    {"sem","new",1},{"sem","wait",1},{"sem","post",1},{"sem","destroy",1},
+                    {"rwlock","new",0},{"rwlock","read",1},{"rwlock","write",1},{"rwlock","release",1},
+                    {"signal","set",2},{"signal","raise",1},{"signal","ignore",1},
+                    // atomic module (bare import atomic, not std.atomic)
+                    {"atomic","new",1},{"atomic","load",1},{"atomic","store",2},
+                    {"atomic","add",2},{"atomic","sub",2},{"atomic","cas",3},{"atomic","exchange",2},
+                    // channel module
+                    {"channel","new",0},{"channel","send",2},{"channel","recv",1},
+                    {"channel","try_recv",1},{"channel","close",1},{"channel","select",1},
+                    {"channel","is_closed",1},{"channel","len",1},
+                    // socket/net module stubs
+                    {"socket","connect",2},{"socket","send",2},{"socket","recv",1},
+                    {"socket","close",1},{"socket","http_get",1},{"socket","http_post",2},
+                    {"socket","bind",2},{"socket","listen",1},{"socket","accept",1},
+                    // net module
+                    {"net","get",1},{"net","post",2},{"net","fetch",1},
+                    // io module
+                    {"io","readfile",1},{"io","writefile",2},{"io","exists",1},
+                    {"io","mkdir",1},{"io","listdir",1},{"io","remove",1},
+                    // doc module
+                    {"doc","tag",2},{"doc","get",1},{"doc","list",0},
+                    // hash module
+                    {"hash","md5",1},{"hash","sha256",1},{"hash","sha1",1},
+                    // path utilities (hash_paths uses)
+                    {"path","basename",1},{"path","dirname",1},{"path","join",2},
+                    {"path","exists",1},{"path","ext",1},
+                    // macro stubs
+                    {"timed",0},
+                    // python FFI
+                    {"python","import",1},{"python","call",3},{"python","get",2},
+                    {"python","getattr",2},{"python","setattr",3},
+                    {"python","set",3},{"python","eval",1},{"python","exec",1},
+                    // ffi module
+                    {"ffi","open",1},{"ffi","close",1},{"ffi","sym",2},{"ffi","call",2},
+                    // bytes module
+                    {"bytes","new",1},{"bytes","get",2},{"bytes","set",3},
+                    {"bytes","len",1},{"bytes","to_str",1},{"bytes","from_str",1},
+                    // gc module
+                    {"gc","collect",0},{"gc","disable",0},{"gc","enable",0},
+                    {"gc","collections",0},{"gc","alloc_count",0},
+                    // addressof/sizeof
+                    {"addressof","of",1},{"ptr","add",2},{"sizeof","of",1},
+                    // smp/cpu
+                    {"smp","count",0},{"smp","id",0},{"cpu","count",0},
+                    {"cpu","has_hyperthreading",0},
+                    {NULL,NULL,0}
+                };
+                for (int _si=0; _stubs[_si].mod; _si++) {
+                    if (strcmp(_stubs[_si].mod, short_name)!=0) continue;
+                    char sfn[128]; snprintf(sfn,sizeof(sfn),"sg_%s_sg_%s",short_name,_stubs[_si].fn);
+                    const char* m=_stubs[_si].mod; const char* f=_stubs[_si].fn;
+                    const char* body = NULL;  // real-runtime body when available
+                    if(!strcmp(m,"io")){
+                        if(!strcmp(f,"writefile")) body="return sage_rt_io_writefile(_a,_b);";
+                        else if(!strcmp(f,"readfile")) body="return sage_rt_io_readfile(_a);";
+                        else if(!strcmp(f,"exists")) body="return sage_rt_io_exists(_a);";
+                        else if(!strcmp(f,"remove")) body="return sage_rt_io_remove(_a);";
+                    } else if(!strcmp(m,"path")){
+                        if(!strcmp(f,"basename")) body="return sage_rt_path_basename(_a);";
+                        else if(!strcmp(f,"dirname")) body="return sage_rt_path_dirname(_a);";
+                        else if(!strcmp(f,"join")) body="return sage_rt_path_join(2,(SageValue[]){_a,_b});";
+                        else if(!strcmp(f,"exists")) body="return sage_rt_path_exists(_a);";
+                        else if(!strcmp(f,"ext")) body="return sage_rt_path_ext(_a);";
+                    } else if(!strcmp(m,"gc")){
+                        if(!strcmp(f,"collect")) body="sage_rt_gc_collect();return sage_rt_nil();";
+                        else if(!strcmp(f,"disable")) body="sage_rt_gc_disable();return sage_rt_nil();";
+                        else if(!strcmp(f,"enable")) body="sage_rt_gc_enable();return sage_rt_nil();";
+                        else if(!strcmp(f,"collections")||!strcmp(f,"alloc_count")) body="return sage_rt_gc_collections();";
+                    } else if(!strcmp(m,"addressof")&&!strcmp(f,"of")){ body="return sage_rt_addressof(_a);";
+                    } else if(!strcmp(m,"sizeof")&&!strcmp(f,"of")){ body="return sage_rt_sizeof(_a);";
+                    } else if(!strcmp(m,"ptr")&&!strcmp(f,"add")){ body="return sage_rt_ptr_add(_a,_b);";
+                    } else if((!strcmp(m,"smp")&&!strcmp(f,"count"))||(!strcmp(m,"cpu")&&!strcmp(f,"count"))){ body="return sage_rt_cpu_count();";
+                    } else if(!strcmp(m,"cpu")&&!strcmp(f,"has_hyperthreading")){ body="return sage_rt_cpu_has_hyperthreading();";
+                    } else if(!strcmp(m,"bytes")){
+                        if(!strcmp(f,"new")) body="return sage_rt_bytes_ctor(_a);";
+                        else if(!strcmp(f,"get")) body="return sage_rt_bytes_get_v(_a,_b);";
+                        else if(!strcmp(f,"set")) body="return sage_rt_bytes_set_v(_a,_b,_c);";
+                        else if(!strcmp(f,"len")) body="return sage_rt_bytes_len_v(_a);";
+                        else if(!strcmp(f,"to_str")) body="return sage_rt_bytes_to_string(_a);";
+                        else if(!strcmp(f,"from_str")) body="return sage_rt_bytes_from_string(_a);";
+                    }
+                    if(body){
+                        int na=_stubs[_si].nargs;
+                        if(na==0) aot_emit(aot,"static SageValue %s(void){%s}",sfn,body);
+                        else if(na==1) aot_emit(aot,"static SageValue %s(SageValue _a){(void)_a;%s}",sfn,body);
+                        else if(na==2) aot_emit(aot,"static SageValue %s(SageValue _a,SageValue _b){(void)_a;(void)_b;%s}",sfn,body);
+                        else aot_emit(aot,"static SageValue %s(SageValue _a,SageValue _b,SageValue _c){(void)_a;(void)_b;(void)_c;%s}",sfn,body);
+                    }
+                    else if (_stubs[_si].nargs==0) aot_emit(aot,"static SageValue %s(void){return sage_rt_nil();}",sfn);
+                    else if (_stubs[_si].nargs==1) aot_emit(aot,"static SageValue %s(SageValue _a){(void)_a;return sage_rt_nil();}",sfn);
+                    else if (_stubs[_si].nargs==2) aot_emit(aot,"static SageValue %s(SageValue _a,SageValue _b){(void)_a;(void)_b;return sage_rt_nil();}",sfn);
+                    else aot_emit(aot,"static SageValue %s(SageValue _a,SageValue _b,SageValue _c){(void)_a;(void)_b;(void)_c;return sage_rt_nil();}",sfn);
+                    aot_register_proc(aot, sfn);
+                    // Register in mod_prefix_map and mod_procs for dict init
+                    if (aot->mod_prefix_map_count < 64) {
+                        snprintf(aot->mod_prefix_map[aot->mod_prefix_map_count].short_name,64,"%s",short_name);
+                        char _pfx[64]; snprintf(_pfx,64,"sg_%s_",short_name);
+                        snprintf(aot->mod_prefix_map[aot->mod_prefix_map_count].full_prefix,128,"%s",_pfx);
+                        aot->mod_prefix_map_count++;
+                    }
+                    if (aot->mod_proc_count < 512) {
+                        char* _mcn_stub=aot_cname(short_name,strlen(short_name));
+                        snprintf(aot->mod_procs[aot->mod_proc_count].mod_cname,64,"%s",_mcn_stub);
+                        snprintf(aot->mod_procs[aot->mod_proc_count].proc_raw,64,"%s",_stubs[_si].fn);
+                        // Use function name directly (not @@ which would try to assign to function)
+                        snprintf(aot->mod_procs[aot->mod_proc_count].wrap_cname,1024,"%s",sfn);
+                        aot->mod_proc_count++;
+                        free(_mcn_stub);
+                    }
+                }
+                // Declare the namespace dict var
+                char* _stub_mcn=aot_cname(short_name,strlen(short_name));
+                aot_emit(aot,"static SageValue %s;",_stub_mcn);
+                aot_set_var_type(aot,short_name,JIT_TYPE_DICT);
+                free(_stub_mcn);
                 break;
             }
             char* source = read_file(path);
@@ -2286,13 +3225,50 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
             // It will be freed after all emission is complete.
             if (!mod_ast) { free(source); aot_emit(aot,"/* import %s: parse failed */",mname); break; }
 
+            // Scan module AST for nested imports (e.g. assert.sage has `import math` inside proc)
+            // and process them before compiling this module so they're available at file scope
+            {
+                // Recursive scan using a stack (limited depth)
+                Stmt* _sq[256]; int _sh=0, _st=0;
+                for(Stmt*_s=mod_ast;_s&&_st<256;_s=_s->next) _sq[_st++]=_s;
+                while(_sh<_st){
+                    Stmt*_s=_sq[_sh++];
+                    if(_s->type==STMT_IMPORT) {
+                        const char* _imn = _s->as.import.module_name;
+                        if(_imn && strcmp(_imn,"_math")!=0) {
+                            // Process this nested import at file scope if not already done
+                            int _ai=0;
+                            for(int _i=0;_i<aot->imported_module_count;_i++)
+                                if(strcmp(aot->imported_modules[_i],_imn)==0){_ai=1;break;}
+                            if(!_ai) { int _saved_mb=aot->in_module_body; aot->in_module_body=0; aot_compile_stmt(aot,_s); aot->in_module_body=_saved_mb; }
+                        }
+                    }
+                    // Recurse into proc bodies, blocks, etc.
+                    if((_s->type==STMT_PROC||_s->type==STMT_ASYNC_PROC)){ProcStmt*_ps=(_s->type==STMT_PROC)?&_s->as.proc:&_s->as.async_proc;for(Stmt*_b=_ps->body;_b&&_st<256;_b=_b->next)_sq[_st++]=_b;}
+                    if(_s->type==STMT_BLOCK)for(Stmt*_b=_s->as.block.statements;_b&&_st<256;_b=_b->next)_sq[_st++]=_b;
+                    if(_s->type==STMT_IF){for(Stmt*_b=_s->as.if_stmt.then_branch;_b&&_st<256;_b=_b->next)_sq[_st++]=_b;for(Stmt*_b=_s->as.if_stmt.else_branch;_b&&_st<256;_b=_b->next)_sq[_st++]=_b;}
+                }
+            }
+
             // Set module prefix for name-mangling
             char saved_prefix[128];
             snprintf(saved_prefix, sizeof(saved_prefix), "%s", aot->current_module_prefix);
             // Build prefix: "arrays" -> "sg_arrays_"
-            char mod_prefix[128]; snprintf(mod_prefix, sizeof(mod_prefix), "sg_%s_", mname);
+            // Build C-safe module prefix: dots → underscores (std.argparse → sg_std_argparse_)
+            char mod_prefix[128]; {
+                int mpl = 0; mod_prefix[mpl++]='s'; mod_prefix[mpl++]='g'; mod_prefix[mpl++]='_';
+                for (const char* mp = mname; *mp && mpl < 122; mp++, mpl++)
+                    mod_prefix[mpl] = (*mp == '.' || *mp == '/') ? '_' : *mp;
+                mod_prefix[mpl++]='_'; mod_prefix[mpl]='\0';
+            }
             snprintf(aot->current_module_prefix, sizeof(aot->current_module_prefix), "%s", mod_prefix);
             aot->in_module_body = 1;
+            // Register short_name → full C prefix mapping
+            if (aot->mod_prefix_map_count < 64) {
+                snprintf(aot->mod_prefix_map[aot->mod_prefix_map_count].short_name, 64, "%s", short_name);
+                snprintf(aot->mod_prefix_map[aot->mod_prefix_map_count].full_prefix, 128, "%s", mod_prefix);
+                aot->mod_prefix_map_count++;
+            }
 
             // Type-infer module body in an isolated type env snapshot
             // (prevent outer scope variable types from contaminating module functions)
@@ -2301,6 +3277,59 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
 
             // Emit a section comment
             aot_emit(aot, "/* ── module %s ─────────────────────────── */", mname);
+
+            // Pre-scan: if module imports _math (native), emit C math.h wrappers NOW
+            // so they appear before the forward-decl loop and #defines resolve correctly
+            for (Stmt* _pms = mod_ast; _pms; _pms = _pms->next) {
+                if (_pms->type == STMT_IMPORT &&
+                    _pms->as.import.module_name &&
+                    strcmp(_pms->as.import.module_name, "_math") == 0) {
+                    aot_compile_stmt(aot, _pms);  // emits wrappers + marks _math imported
+                    break;
+                }
+            }
+
+            // First pass: forward-declare all module procs (prevents implicit-int errors)
+            for (Stmt* ms = mod_ast; ms; ms = ms->next) {
+                if (ms->type != STMT_PROC && ms->type != STMT_ASYNC_PROC) continue;
+                ProcStmt* ps2 = (ms->type==STMT_PROC)?&ms->as.proc:&ms->as.async_proc;
+                char* _pn = aot_cname_tok(ps2->name);
+                // Full name = mod_prefix + full pn (mod_prefix already ends with _)
+                // e.g. "sg_std_argparse_" + "sg_create" = "sg_std_argparse_sg_create"
+                aot_emit(aot,"static SageValue %s%s();",mod_prefix,_pn);
+                free(_pn);
+            }
+            aot_blank(aot);
+
+            // Pre-register ALL module procs before emitting any bodies
+            for (Stmt* ms2 = mod_ast; ms2; ms2 = ms2->next) {
+                if (ms2->type != STMT_PROC && ms2->type != STMT_ASYNC_PROC) continue;
+                ProcStmt* ps2b = (ms2->type==STMT_PROC)?&ms2->as.proc:&ms2->as.async_proc;
+                char* pn_pre = aot_cname_tok(ps2b->name);
+                char full_pfx_pre[256]; snprintf(full_pfx_pre,sizeof(full_pfx_pre),"%s%s",mod_prefix,pn_pre);
+                aot_register_proc(aot, pn_pre);
+                aot_register_proc(aot, full_pfx_pre);
+                free(pn_pre);
+            }
+            // Emit #define aliases for all module LET and comptime LET vars
+            for (Stmt* ms2 = mod_ast; ms2; ms2 = ms2->next) {
+                if (ms2->type == STMT_LET) {
+                    char* _avn = aot_cname_tok(ms2->as.let.name);
+                    aot_emit(aot, "#define %s %s%s", _avn, mod_prefix, _avn);
+                    free(_avn);
+                } else if (ms2->type == STMT_COMPTIME) {
+                    Stmt* _cbody = ms2->as.comptime.body;
+                    if (_cbody && _cbody->type == STMT_BLOCK)
+                        _cbody = _cbody->as.block.statements;
+                    for (Stmt* _cs = _cbody; _cs; _cs = _cs->next) {
+                        if (_cs->type == STMT_LET) {
+                            char* _avn = aot_cname_tok(_cs->as.let.name);
+                            aot_emit(aot, "#define %s %s%s", _avn, mod_prefix, _avn);
+                            free(_avn);
+                        }
+                    }
+                }
+            }
 
             // Emit all top-level procs, classes, structs, enums from the module
             // Each gets the module prefix prepended to its C name
@@ -2317,12 +3346,14 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
                     ProcStmt* ps = (ms->type==STMT_PROC)?&ms->as.proc:&ms->as.async_proc;
                     char* pn_c   = aot_cname_tok(ps->name);
                     int np = ps->param_count;
-                    char mcn2[256]; snprintf(mcn2,sizeof(mcn2),"sg_%s",mname);
+                    // mcn2 = C name of the full module path (for function name prefix)
+                    char* _mcn2_tmp=aot_cname(mname,strlen(mname)); char mcn2[256]; snprintf(mcn2,sizeof(mcn2),"%s",_mcn2_tmp); free(_mcn2_tmp);
+                    // mcn_short = C name for the short module name (namespace dict var, e.g. sg_argparse)
+                    char* _mcn_sn=aot_cname(short_name,strlen(short_name)); char mcn_short[128]; snprintf(mcn_short,sizeof(mcn_short),"%s",_mcn_sn); free(_mcn_sn);
                     char wrap_name[256]; snprintf(wrap_name,sizeof(wrap_name),"_mwrap_%s_%s",mcn2,pn_c);
                     aot_emit(aot,"static SageValue %s(int _argc, SageValue* _argv, void* _env) {",wrap_name);
                     aot->indent++;
                     aot_emit(aot,"(void)_env;");
-                    // Call the prefixed function with args
                     char arglist[512]; int ap=0;
                     for (int pi=0; pi<np; pi++)
                         ap+=snprintf(arglist+ap, sizeof(arglist)-ap, "%s(_argc>%d?_argv[%d]:sage_rt_nil())",
@@ -2330,18 +3361,17 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
                     arglist[ap]='\0';
                     aot_emit(aot,"return %s_%s(%s);", mcn2, pn_c, arglist);
                     aot->indent--; aot_emit(aot,"}");
-                    // Register the unregistered C name (sg_flatten) AND the prefixed name
-                    // (sg_arrays_sg_flatten) so recursive self-calls inside the module work
-                    aot_register_proc(aot, pn_c);                    // sg_flatten
+                    aot_register_proc(aot, pn_c);
                     char full_pfx[256]; snprintf(full_pfx,sizeof(full_pfx),"%s_%s",mcn2,pn_c);
-                    aot_register_proc(aot, full_pfx);                // sg_arrays_sg_flatten
+                    aot_register_proc(aot, full_pfx);
                     // Register in mod_procs for main() dict population
+                    // Use mcn_short (short name C var) so dict is keyed correctly
                     if (aot->mod_proc_count < 512) {
                         char pn_raw[64]; int prl=ps->name.length<63?ps->name.length:63;
                         memcpy(pn_raw,ps->name.start,prl); pn_raw[prl]='\0';
-                        snprintf(aot->mod_procs[aot->mod_proc_count].mod_cname, 64, "%s", mcn2);
+                        snprintf(aot->mod_procs[aot->mod_proc_count].mod_cname, 64, "%s", mcn_short);
                         snprintf(aot->mod_procs[aot->mod_proc_count].proc_raw,  64, "%s", pn_raw);
-                        snprintf(aot->mod_procs[aot->mod_proc_count].wrap_cname,128, "%s", wrap_name);
+                        snprintf(aot->mod_procs[aot->mod_proc_count].wrap_cname,1024, "%s", wrap_name);
                         aot->mod_proc_count++;
                     }
                     free(pn_c);
@@ -2350,37 +3380,72 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
                     // Skip nested imports inside module body — they are interpreter-only
                     aot_compile_stmt(aot, ms);
                 } else if (ms->type == STMT_LET) {
-                    // Module-level variable — export into dict via inline expression in main()
-                    if (aot->mod_proc_count < 512) {
-                        char vn[64]; int prl=ms->as.let.name.length<63?ms->as.let.name.length:63;
-                        memcpy(vn,ms->as.let.name.start,prl); vn[prl]='\0';
-                        char mcn2[64]; snprintf(mcn2,sizeof(mcn2),"sg_%s",mname);
-                        char* val = ms->as.let.initializer
-                            ? aot_expr(aot, ms->as.let.initializer, JIT_TYPE_UNKNOWN)
-                            : strdup("sage_rt_nil()");
-                        // wrap_cname = "@@" + c_expression (eval'd in main())
-                        snprintf(aot->mod_procs[aot->mod_proc_count].mod_cname, 64, "%s", mcn2);
-                        snprintf(aot->mod_procs[aot->mod_proc_count].proc_raw,  64, "%s", vn);
-                        snprintf(aot->mod_procs[aot->mod_proc_count].wrap_cname,256, "@@%s", val);
-                        aot->mod_proc_count++;
+                    // Module-level variable — emit as static file-scope var
+                    // so it's accessible from within module proc bodies
+                    char* vn = aot_cname_tok(ms->as.let.name);
+                    if (ms->as.let.initializer) {
+                        char* val = aot_expr(aot, ms->as.let.initializer, JIT_TYPE_UNKNOWN);
+                        aot_emit(aot, "static SageValue %s%s = {0}; /* module var */", mod_prefix, vn);
+                        // Also register in mod_procs for dict export in main()
+                        if (aot->mod_proc_count < 512) {
+                            char raw_vn[64]; int prl=ms->as.let.name.length<63?ms->as.let.name.length:63;
+                            memcpy(raw_vn,ms->as.let.name.start,prl); raw_vn[prl]='\0';
+                            char* _mcn_sn2=aot_cname(short_name,strlen(short_name));
+                            snprintf(aot->mod_procs[aot->mod_proc_count].mod_cname, 64, "%s", _mcn_sn2);
+                            snprintf(aot->mod_procs[aot->mod_proc_count].proc_raw, 64, "%s", raw_vn);
+                            snprintf(aot->mod_procs[aot->mod_proc_count].wrap_cname, 1024, "@@%s", val);
+                            aot->mod_proc_count++;
+                            free(_mcn_sn2);
+                        }
                         free(val);
+                    }
+                    free(vn);
+                } else if (ms->type == STMT_COMPTIME) {
+                    // Comptime block — emit inner LET vars as static file-scope statics
+                    // Parser wraps the body in a STMT_BLOCK — unwrap it
+                    Stmt* _cbody2 = ms->as.comptime.body;
+                    if (_cbody2 && _cbody2->type == STMT_BLOCK)
+                        _cbody2 = _cbody2->as.block.statements;
+                    for (Stmt* _cs = _cbody2; _cs; _cs = _cs->next) {
+                        if (_cs->type == STMT_LET && _cs->as.let.initializer) {
+                            char* _cvn = aot_cname_tok(_cs->as.let.name);
+                            char* _cval = aot_expr(aot, _cs->as.let.initializer, JIT_TYPE_UNKNOWN);
+                            aot_emit(aot, "static SageValue %s%s = {0}; /* comptime */", mod_prefix, _cvn);
+                            if (aot->mod_proc_count < 512) {
+                                char _crv[64]; int _prl=_cs->as.let.name.length<63?_cs->as.let.name.length:63;
+                                memcpy(_crv,_cs->as.let.name.start,_prl); _crv[_prl]='\0';
+                                char* _cmsn=aot_cname(short_name,strlen(short_name));
+                                snprintf(aot->mod_procs[aot->mod_proc_count].mod_cname,64,"%s",_cmsn);
+                                snprintf(aot->mod_procs[aot->mod_proc_count].proc_raw,64,"%s",_crv);
+                                snprintf(aot->mod_procs[aot->mod_proc_count].wrap_cname,1024,"@@%s",_cval);
+                                aot->mod_proc_count++;
+                                free(_cmsn);
+                            }
+                            free(_cval); free(_cvn);
+                        }
                     }
                 }
                 // Skip everything else (STMT_IMPORT, bare statements, etc.)
             }
 
-            // Declare the module namespace variable
-            char* mcn = aot_cname(mname, strlen(mname));
+            // Declare the module namespace variable using the short name (last component)
+            // e.g. "std.argparse" → var is "sg_argparse", accessed as argparse.create(...)
+            // LET var #defines are intentionally left active after module compilation
+            // so cross-module references to variables like sg_PI, sg_E work correctly.
+            // Individual procs use the full prefixed name via the EXPR_CALL rewrite.
+            char* mcn = aot_cname(short_name, strlen(short_name));
             aot_emit(aot, "static SageValue %s; /* module %s namespace */", mcn, mname);
             aot_blank(aot);
 
-            // Register module var type as DICT (for EXPR_GET d.key dispatch)
-            aot_set_var_type(aot, mname, JIT_TYPE_DICT);
-            // Also register the module var as known (for direct-call detection)
-            // We save the type before restoring count so it persists in outer scope
-            int mod_var_idx = -1;
-            for (int _mi=0; _mi<aot->type_env.count; _mi++) {
-                if (strcmp(aot->type_env.vars[_mi].name, mname)==0) { mod_var_idx=_mi; break; }
+            // Register module var type as DICT using short_name (matches Sage source)
+            aot_set_var_type(aot, short_name, JIT_TYPE_DICT);
+            // Also register in imported_modules under short_name for direct-call detection
+            {
+                int already_sn = 0;
+                for (int _i=0; _i<aot->imported_module_count; _i++)
+                    if (strcmp(aot->imported_modules[_i], short_name)==0) { already_sn=1; break; }
+                if (!already_sn && aot->imported_module_count < 64)
+                    snprintf(aot->imported_modules[aot->imported_module_count++], 128, "%s", short_name);
             }
 
             free(mcn);
@@ -2389,14 +3454,65 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
             // Restore type env to pre-module state (module vars don't pollute outer scope)
             aot->type_env.count = saved_type_count_mod;
             // Re-register the module namespace variable as DICT in the outer scope
-            aot_set_var_type(aot, mname, JIT_TYPE_DICT);
+            aot_set_var_type(aot, short_name, JIT_TYPE_DICT);
+            // Handle "from X import Y, Z" items — register as global aliases
+            // This must happen even if the module was already imported (multiple from-import lines)
+            if (stmt->as.import.item_count > 0 && stmt->as.import.items) {
+                // Find the full C prefix for this module (may be freshly registered above)
+                const char* _full_pfx_items = NULL;
+                for (int _pmi=0; _pmi<aot->mod_prefix_map_count; _pmi++) {
+                    if (strcmp(aot->mod_prefix_map[_pmi].short_name, short_name)==0) {
+                        _full_pfx_items = aot->mod_prefix_map[_pmi].full_prefix; break;
+                    }
+                }
+                if (_full_pfx_items) {
+                    for (int _ii=0; _ii<stmt->as.import.item_count; _ii++) {
+                        const char* item = stmt->as.import.items[_ii];
+                        if (!item) continue;
+                        char* item_c = aot_cname(item, strlen(item));
+                        // Check if #define was already emitted (avoid duplicate defines)
+                        // We track by checking if item_c is already the SAME as a prefixed name
+                        // Always emit #define to ensure C code can resolve the symbol
+                        // (known_procs registration is separate from C-level name resolution)
+                        char pfx_fn[256]; snprintf(pfx_fn,sizeof(pfx_fn),"%s%s",_full_pfx_items,item_c);
+                        // Only emit if the item name differs from the prefixed name
+                        if (strcmp(item_c, pfx_fn) != 0) {
+                            // Check not already emitted in this compilation unit
+                            int _already_emitted = 0;
+                            for (int _ki=0; _ki<aot->known_proc_count; _ki++) {
+                                if (strcmp(aot->known_procs[_ki], pfx_fn)==0) { _already_emitted=1; break; }
+                            }
+                            // emit the define regardless — multiple identical #defines are OK in C
+                            aot_emit(aot, "#define %s %s", item_c, pfx_fn);
+                            if (!_already_emitted) aot_register_proc(aot, item_c);
+                        }
+                        free(item_c);
+                    }
+                }
+            }
+
             // Restore prefix and module-body flag
             snprintf(aot->current_module_prefix, sizeof(aot->current_module_prefix), "%s", saved_prefix);
             aot->in_module_body = 0;
             break;
         }
-        case STMT_SPAWN:  aot_emit(aot,"/* spawn — needs libpthread */"); break;
-        case STMT_COMPTIME: for(Stmt*s=stmt->as.comptime.body;s;s=s->next) aot_compile_stmt(aot,s); break;
+        case STMT_SPAWN: {
+            // Synchronous model: run the spawned block inline now.
+            aot_emit(aot,"{ /* spawn block (synchronous) */"); aot->indent++;
+            for(Stmt*s=stmt->as.spawn_stmt.body;s;s=s->next) aot_compile_stmt(aot,s);
+            aot->indent--; aot_emit(aot,"}");
+            break;
+        }
+        case STMT_COMPTIME: {
+            // Parser wraps comptime body in a STMT_BLOCK — unwrap it so vars
+            // are emitted inline (not scoped) and stay visible to subsequent stmts
+            Stmt* _ct_body = stmt->as.comptime.body;
+            if (_ct_body && _ct_body->type == STMT_BLOCK)
+                _ct_body = _ct_body->as.block.statements;
+            aot_infer_body(aot, _ct_body);
+            for (Stmt* s = _ct_body; s; s = s->next) aot_compile_stmt(aot, s);
+            break;
+        }
         case STMT_PROC: case STMT_ASYNC_PROC: {
             // Nested proc: emit capture struct + make_fn
             ProcStmt* ps=(stmt->type==STMT_PROC)?&stmt->as.proc:&stmt->as.async_proc;
@@ -2404,8 +3520,8 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
             char wname[128]; snprintf(wname,sizeof(wname),"_sw_%s",pname);
             char sname[140]; snprintf(sname,sizeof(sname),"_cap_%s",pname);
             // Collect captures for this nested proc
-            const char* caps[32]; int ncaps=0;
-            _collect_free_vars_stmt(ps->body, caps, &ncaps, 32, ps);
+            const char* caps[64]; int ncaps=0;
+            _collect_free_vars_stmt(ps->body, caps, &ncaps, 64, ps);
             if(ncaps>0){
                 // Allocate capture struct and fill it
                 aot_emit(aot,"%s* _env_%s = (%s*)malloc(sizeof(%s));",sname,pname,sname,sname);
@@ -2432,7 +3548,43 @@ void aot_compile_stmt(AotCompiler* aot, Stmt* stmt) {
             free(pname);
             break;
         }
-        case STMT_TRAIT: case STMT_MACRO_DEF: break;
+        case STMT_TRAIT: {
+            // Emit trait as a static SageValue dict: {__name__: "TraitName", __methods__: [...]}
+            if (!stmt->as.trait_stmt.name.start) break;
+            char* tname = aot_cname_tok(stmt->as.trait_stmt.name);
+            char raw_tn[64]; int prl=stmt->as.trait_stmt.name.length<63?stmt->as.trait_stmt.name.length:63;
+            memcpy(raw_tn,stmt->as.trait_stmt.name.start,prl); raw_tn[prl]='\0';
+            aot_emit(aot,"static SageValue %s;",tname);
+            aot_set_var_type(aot, raw_tn, JIT_TYPE_DICT);
+            // Build method push calls
+            char push_expr[512]=""; int pp=0;
+            for(Stmt*ms=stmt->as.trait_stmt.methods;ms;ms=ms->next){
+                if(ms->type==STMT_PROC||ms->type==STMT_ASYNC_PROC){
+                    ProcStmt*ps2=(ms->type==STMT_PROC)?&ms->as.proc:&ms->as.async_proc;
+                    char mn[64]; int ml=ps2->name.length<63?ps2->name.length:63;
+                    memcpy(mn,ps2->name.start,ml); mn[ml]='\0';
+                    pp+=snprintf(push_expr+pp,sizeof(push_expr)-pp,
+                        "sage_rt_array_push(_a,sage_rt_string(\"%s\"));",mn);
+                }
+            }
+            // Register in mod_procs for main() init via @@ expression
+            if (aot->mod_proc_count < 512) {
+                // Use the trait's var name as both mod_cname and proc_raw
+                // The @@ initializer assigns directly to sg_TraitName
+                snprintf(aot->mod_procs[aot->mod_proc_count].mod_cname,64,"__trait__");
+                snprintf(aot->mod_procs[aot->mod_proc_count].proc_raw,64,"%s",raw_tn);
+                snprintf(aot->mod_procs[aot->mod_proc_count].wrap_cname,1024,
+                    "@@({SageValue _td=sage_rt_dict_new();"
+                    "sage_rt_dict_set(_td,sage_rt_string(\"__name__\"),sage_rt_string(\"%s\"));"
+                    "SageValue _tm=({SageValue _a=sage_rt_array_new();%s_a;});"
+                    "sage_rt_dict_set(_td,sage_rt_string(\"__methods__\"),_tm);_td;})",
+                    raw_tn, push_expr);
+                aot->mod_proc_count++;
+            }
+            free(tname);
+            break;
+        }
+        case STMT_MACRO_DEF: break;
         default: aot_emit(aot,"/* unhandled stmt %d */",stmt->type); break;
     }
 }
@@ -2452,12 +3604,21 @@ static void aot_scan_expr_calls(AotCompiler* aot, const char* fname, int flen, E
             if (cl == flen && memcmp(cn, fname, flen) == 0) {
                 for (int i = 0; i < e->as.call.arg_count; i++) {
                     JitTypeTag t = aot_infer_expr(aot, e->as.call.args[i]);
-                    if (t != JIT_TYPE_UNKNOWN) {
-                        char key[280];
-                        snprintf(key, sizeof(key), "%.*s#%d", flen, fname, i);
-                        // Only set if not already set (first call wins)
-                        if (aot_get_var_type(aot, key) == JIT_TYPE_UNKNOWN)
-                            aot_set_var_type(aot, key, t);
+                    char key[280], seen[300];
+                    snprintf(key, sizeof(key), "%.*s#%d", flen, fname, i);
+                    snprintf(seen, sizeof(seen), "%.*s#%d$seen", flen, fname, i);
+                    // Param type is the type all call sites agree on. If any call
+                    // site passes a different (or unknown) type, the param must be
+                    // a generic SageValue — otherwise the proc body, compiled for
+                    // the first call's type, mismatches the boxed arg the other
+                    // caller passes (e.g. add(3,4) then add(d["k"],1)).
+                    if (aot_get_var_type(aot, seen) == JIT_TYPE_UNKNOWN) {
+                        // First observation of this param.
+                        aot_set_var_type(aot, seen, JIT_TYPE_BOOL); // mark seen (sentinel)
+                        aot_set_var_type(aot, key, t);
+                    } else {
+                        JitTypeTag prev = aot_get_var_type(aot, key);
+                        if (prev != t) aot_set_var_type(aot, key, JIT_TYPE_UNKNOWN);
                     }
                 }
             }
@@ -2554,12 +3715,26 @@ static void _collect_free_vars(Expr* e, const char** caps, int* ncaps, int maxca
             int nl=(int)e->as.variable.name.length;
             char* namecopy=(char*)malloc(nl+1);
             memcpy(namecopy,e->as.variable.name.start,nl); namecopy[nl]='\0';
+            // Exclude language builtins — they're not captures
+            static const char* _builtins[] = {
+                "str","int","float","bool","len","print","println","typeof","type",
+                "range","range_inc","dict_has","array_push","nil","true","false",
+                "None","Some","Ok","Err","assert","min","max","abs","ord","chr",
+                "contains","input","open","close","read","write","exit","gc_disable",
+                "gc_enable","gc_collect","gc_collections","ffi_open","ffi_close","ffi_call",
+                NULL
+            };
+            int is_builtin = 0;
+            for(int _bi=0; _builtins[_bi]; _bi++)
+                if(strcmp(namecopy,_builtins[_bi])==0){is_builtin=1;break;}
             int dup=0;
-            for(int i=0;i<*ncaps;i++){
-                if(strcmp(caps[i],namecopy)==0){ dup=1; break; }
-            }
-            if(!dup) caps[(*ncaps)++] = namecopy;
-            else free(namecopy);
+            if(!is_builtin){
+                for(int i=0;i<*ncaps;i++){
+                    if(strcmp(caps[i],namecopy)==0){ dup=1; break; }
+                }
+                if(!dup && *ncaps < maxcaps) caps[(*ncaps)++] = namecopy;
+                else free(namecopy);
+            } else free(namecopy);
         }
         return;
     }
@@ -2576,11 +3751,34 @@ static void _collect_free_vars(Expr* e, const char** caps, int* ncaps, int maxca
         case EXPR_SET:
             _collect_free_vars(e->as.set.object,caps,ncaps,maxcaps,ps);
             _collect_free_vars(e->as.set.value,caps,ncaps,maxcaps,ps); break;
+        case EXPR_PROPAGATE:
+        case EXPR_FORCE_UNWRAP:
+            if (e->as.unwrap.operand) _collect_free_vars(e->as.unwrap.operand,caps,ncaps,maxcaps,ps);
+            break;
+        case EXPR_NULLCOAL:
+            if (e->as.nullcoal.left) _collect_free_vars(e->as.nullcoal.left,caps,ncaps,maxcaps,ps);
+            if (e->as.nullcoal.right) _collect_free_vars(e->as.nullcoal.right,caps,ncaps,maxcaps,ps);
+            break;
+        case EXPR_INDEX:
+            if (e->as.index.array) _collect_free_vars(e->as.index.array,caps,ncaps,maxcaps,ps);
+            if (e->as.index.index) _collect_free_vars(e->as.index.index,caps,ncaps,maxcaps,ps);
+            break;
         default: break;
     }
 }
 
 static void _collect_free_vars_stmt(Stmt* s, const char** caps, int* ncaps, int maxcaps, ProcStmt* ps) {
+    // First pass: collect all locally-defined var names (from let/var statements)
+    // so we can exclude them from the free-variable (capture) set
+    const char* locals[128]; int nlocals = 0;
+    for(Stmt* _ls=s; _ls; _ls=_ls->next) {
+        if(_ls->type==STMT_LET && _ls->as.let.name.start && nlocals<128) {
+            int nl = _ls->as.let.name.length;
+            char* lname = (char*)malloc(nl+1);
+            memcpy(lname, _ls->as.let.name.start, nl); lname[nl]='\0';
+            locals[nlocals++] = lname;
+        }
+    }
     for(;s;s=s->next){
         Expr* e=NULL;
         switch(s->type){
@@ -2588,23 +3786,38 @@ static void _collect_free_vars_stmt(Stmt* s, const char** caps, int* ncaps, int 
             case STMT_LET: e=s->as.let.initializer; break;
             case STMT_RETURN: e=s->as.ret.value; break;
             case STMT_IF:
-                _collect_free_vars(s->as.if_stmt.condition,caps,ncaps,maxcaps,ps);
-                _collect_free_vars_stmt(s->as.if_stmt.then_branch,caps,ncaps,maxcaps,ps);
-                _collect_free_vars_stmt(s->as.if_stmt.else_branch,caps,ncaps,maxcaps,ps);
+                if (s->as.if_stmt.condition) _collect_free_vars(s->as.if_stmt.condition,caps,ncaps,maxcaps,ps);
+                if (s->as.if_stmt.then_branch) _collect_free_vars_stmt(s->as.if_stmt.then_branch,caps,ncaps,maxcaps,ps);
+                if (s->as.if_stmt.else_branch) _collect_free_vars_stmt(s->as.if_stmt.else_branch,caps,ncaps,maxcaps,ps);
                 break;
             case STMT_WHILE:
-                _collect_free_vars(s->as.while_stmt.condition,caps,ncaps,maxcaps,ps);
-                _collect_free_vars_stmt(s->as.while_stmt.body,caps,ncaps,maxcaps,ps);
+                if (s->as.while_stmt.condition) _collect_free_vars(s->as.while_stmt.condition,caps,ncaps,maxcaps,ps);
+                if (s->as.while_stmt.body) _collect_free_vars_stmt(s->as.while_stmt.body,caps,ncaps,maxcaps,ps);
                 break;
             case STMT_BLOCK:
-                _collect_free_vars_stmt(s->as.block.statements,caps,ncaps,maxcaps,ps);
+                if (s->as.block.statements) _collect_free_vars_stmt(s->as.block.statements,caps,ncaps,maxcaps,ps);
                 break;
             case STMT_FOR:
-                _collect_free_vars_stmt(s->as.for_stmt.body,caps,ncaps,maxcaps,ps);
+                if (s->as.for_stmt.body) _collect_free_vars_stmt(s->as.for_stmt.body,caps,ncaps,maxcaps,ps);
                 break;
             default: break;
         }
         if(e) _collect_free_vars(e,caps,ncaps,maxcaps,ps);
+    }
+    // Remove any captured vars that are locally defined in this scope
+    // NOTE: do NOT free caps[ci] here — the caller (aot_emit_one_nested_proc) owns the array
+    // Freeing here causes double-free because recursive calls share the same caps array
+    for(int li=0; li<nlocals; li++) {
+        for(int ci=0; ci<*ncaps; ci++) {
+            if(strcmp(caps[ci], locals[li])==0) {
+                // Shift remaining caps down (caps[ci] ownership transfers to caller, not freed here)
+                for(int ri=ci; ri<(*ncaps)-1; ri++) caps[ri]=caps[ri+1];
+                caps[(*ncaps)-1] = NULL;  // clear the dangling slot
+                (*ncaps)--;
+                ci--;
+            }
+        }
+        free((char*)locals[li]);
     }
 }
 
@@ -2615,8 +3828,8 @@ static void aot_emit_one_nested_proc(AotCompiler* aot, Stmt* s) {
     // Emit all nested procs within this proc first (recursive)
     aot_emit_nested_procs(aot, ps->body);
     // Collect free variables (captures)
-    const char* caps[32]; int ncaps=0;
-    _collect_free_vars_stmt(ps->body, caps, &ncaps, 32, ps);
+    const char* caps[64]; int ncaps=0;
+    _collect_free_vars_stmt(ps->body, caps, &ncaps, 64, ps);
     // Emit capture struct type
     char sname[140]; snprintf(sname,sizeof(sname),"_cap_%s",pname);
     if(ncaps>0){
@@ -2650,7 +3863,12 @@ static void aot_emit_one_nested_proc(AotCompiler* aot, Stmt* s) {
         }
     }
     aot_infer_body(aot, ps->body);
+    // Compile body — STMT_LET inside will #undef capture aliases when redefining same name
+    // (handled in STMT_LET by checking for matching capture #define)
+    int _saved_cb = aot->in_closure_body;
+    aot->in_closure_body = (ncaps > 0) ? 1 : _saved_cb;
     for(Stmt* bs = ps->body; bs; bs = bs->next) aot_compile_stmt(aot, bs);
+    aot->in_closure_body = _saved_cb;
     // No explicit writeback needed - #define makes assignments write directly to struct
     // Undefine the macros to avoid polluting global scope
     if(ncaps>0){
@@ -2760,11 +3978,16 @@ static void aot_emit_proc(AotCompiler* aot, Stmt* s) {
         fname = base_fname;
     }
 
+    // Emit all nested procs (closures) BEFORE this proc so they're declared
+    aot_emit_nested_procs(aot, ps->body);
+
     // Save type env state to restore after proc (proc params are local)
     int saved_type_count = aot->type_env.count;
     // Set param types (override any existing entry to avoid cross-proc pollution)
+    // Generic procs (with type params like [T]) always use SageValue params
+    int is_generic = (ps->type_param_count > 0);
     for (int i = 0; i < ps->param_count; i++) {
-        JitTypeTag pt = aot_param_type(aot, ps->name.start, ps->name.length, i);
+        JitTypeTag pt = is_generic ? JIT_TYPE_UNKNOWN : aot_param_type(aot, ps->name.start, ps->name.length, i);
         if (pt != JIT_TYPE_UNKNOWN) {
             char pname[256];
             int len = ps->params[i].length<255?ps->params[i].length:255;
@@ -2804,7 +4027,10 @@ static void aot_emit_proc(AotCompiler* aot, Stmt* s) {
             // the coroutine body because params come from _co->argv (always boxed)
             int coro_saved_count = aot->type_env.count;
             aot->type_env.count = 0;
+            int _saved_in_proc2 = aot->in_proc_body;
+            aot->in_proc_body = 1;
             for (Stmt* bs = ps->body; bs; bs = bs->next) aot_compile_stmt(aot, bs);
+            aot->in_proc_body = _saved_in_proc2;
             aot->in_coro_body = 0;
             aot->type_env.count = coro_saved_count;
             aot_emit(aot, "_co->done = 1;");
@@ -2899,7 +4125,7 @@ static void aot_emit_proc(AotCompiler* aot, Stmt* s) {
     aot_emit(aot, "static SageValue %s(", fname);
     aot->indent++;
     for (int i = 0; i < ps->param_count; i++) {
-        JitTypeTag pt = aot_param_type(aot, ps->name.start, ps->name.length, i);
+        JitTypeTag pt = is_generic ? JIT_TYPE_UNKNOWN : aot_param_type(aot, ps->name.start, ps->name.length, i);
         char* pn = aot_cname_tok(ps->params[i]);
         if (jit_is_unboxed(pt)) {
             aot_emit(aot, "%s %s%s", jit_ctype(pt), pn, i<ps->param_count-1?",":"");
@@ -2913,7 +4139,19 @@ static void aot_emit_proc(AotCompiler* aot, Stmt* s) {
     aot_emit(aot, ") {"); aot->indent++;
     int _saved_defer = aot->defer_count;
     aot->defer_count = 0;  // Reset defer stack for this function
+    int _saved_in_proc = aot->in_proc_body;
+    aot->in_proc_body = 1;
+    // Recursion-depth guard — only for procs that can reach themselves. The
+    // cleanup handler decrements on every normal exit; try frames restore the
+    // counter on unwind. The post-increment read also defeats tail-call
+    // optimisation of self-recursion (so infinite recursion is caught instead
+    // of spinning forever).
+    if (!aot->current_module_prefix[0] && aot_is_recursive_proc(aot, ps->name)) {
+        aot_emit(aot, "int _sage_rec __attribute__((cleanup(sage_rt_depth_pop))) = ++sage_rt_call_depth;");
+        aot_emit(aot, "if (_sage_rec > SAGE_RT_MAX_DEPTH) sage_rt_recursion_error();");
+    }
     for(Stmt* bs = ps->body; bs; bs = bs->next) aot_compile_stmt(aot, bs);
+    aot->in_proc_body = _saved_in_proc;
     // Emit pending defers at function end (LIFO)
     for(int _di=aot->defer_count-1;_di>=0;_di--){
         aot_emit(aot,"{ /* defer */"); aot->indent++;
@@ -2931,8 +4169,283 @@ static void aot_emit_proc(AotCompiler* aot, Stmt* s) {
 
 
 
+// Returns 1 if var_name appears as an EXPR_VARIABLE anywhere in the expr tree
+static int _expr_refs_var(Expr* e, const char* var, int vlen) {
+    if (!e) return 0;
+    if (e->type == EXPR_VARIABLE) {
+        if ((int)e->as.variable.name.length == vlen &&
+            memcmp(e->as.variable.name.start, var, vlen) == 0) return 1;
+    }
+    switch (e->type) {
+        case EXPR_BINARY: return _expr_refs_var(e->as.binary.left,var,vlen) || _expr_refs_var(e->as.binary.right,var,vlen);
+        case EXPR_CALL: {
+            if (_expr_refs_var(e->as.call.callee,var,vlen)) return 1;
+            for (int i=0;i<e->as.call.arg_count;i++) if(_expr_refs_var(e->as.call.args[i],var,vlen)) return 1;
+            return 0;
+        }
+        case EXPR_GET: return _expr_refs_var(e->as.get.object,var,vlen);
+        case EXPR_SET:
+            // Bare-variable assignment `x = v` is parsed as SET with object==NULL
+            // and the target name in `property`. Count that as a use of `x`.
+            if (e->as.set.object == NULL &&
+                (int)e->as.set.property.length == vlen &&
+                memcmp(e->as.set.property.start, var, vlen) == 0) return 1;
+            return _expr_refs_var(e->as.set.object,var,vlen) || _expr_refs_var(e->as.set.value,var,vlen);
+        case EXPR_INDEX: return _expr_refs_var(e->as.index.array,var,vlen) || _expr_refs_var(e->as.index.index,var,vlen);
+        case EXPR_INDEX_SET: return _expr_refs_var(e->as.index_set.array,var,vlen) ||
+                                    _expr_refs_var(e->as.index_set.index,var,vlen) ||
+                                    _expr_refs_var(e->as.index_set.value,var,vlen);
+        case EXPR_SLICE: return _expr_refs_var(e->as.slice.array,var,vlen) ||
+                                _expr_refs_var(e->as.slice.start,var,vlen) ||
+                                _expr_refs_var(e->as.slice.end,var,vlen);
+        case EXPR_ARRAY: { for (int i=0;i<e->as.array.count;i++) if(_expr_refs_var(e->as.array.elements[i],var,vlen)) return 1; return 0; }
+        case EXPR_TUPLE: { for (int i=0;i<e->as.tuple.count;i++) if(_expr_refs_var(e->as.tuple.elements[i],var,vlen)) return 1; return 0; }
+        case EXPR_DICT:  { for (int i=0;i<e->as.dict.count;i++) if(_expr_refs_var(e->as.dict.values[i],var,vlen)) return 1; return 0; }
+        case EXPR_RANGE: return _expr_refs_var(e->as.range.low,var,vlen) || _expr_refs_var(e->as.range.high,var,vlen);
+        case EXPR_AWAIT: return _expr_refs_var(e->as.await.expression,var,vlen);
+        case EXPR_FORCE_UNWRAP:
+        case EXPR_PROPAGATE: return _expr_refs_var(e->as.unwrap.operand,var,vlen);
+        case EXPR_NULLCOAL: return _expr_refs_var(e->as.nullcoal.left,var,vlen) || _expr_refs_var(e->as.nullcoal.right,var,vlen);
+        case EXPR_OPTCHAIN: return _expr_refs_var(e->as.optchain.object,var,vlen);
+        default: return 0;
+    }
+}
+static int _stmt_refs_var(Stmt* s, const char* var, int vlen) {
+    for (; s; s = s->next) {
+        switch (s->type) {
+            case STMT_EXPRESSION: if(_expr_refs_var(s->as.expression,var,vlen)) return 1; break;
+            case STMT_LET: if(_expr_refs_var(s->as.let.initializer,var,vlen)) return 1; break;
+            case STMT_RETURN: if(s->as.ret.value && _expr_refs_var(s->as.ret.value,var,vlen)) return 1; break;
+            case STMT_IF: if(_expr_refs_var(s->as.if_stmt.condition,var,vlen)||_stmt_refs_var(s->as.if_stmt.then_branch,var,vlen)||_stmt_refs_var(s->as.if_stmt.else_branch,var,vlen)) return 1; break;
+            case STMT_WHILE: if(_expr_refs_var(s->as.while_stmt.condition,var,vlen)||_stmt_refs_var(s->as.while_stmt.body,var,vlen)) return 1; break;
+            case STMT_FOR: if(_expr_refs_var(s->as.for_stmt.iterable,var,vlen)||_stmt_refs_var(s->as.for_stmt.body,var,vlen)) return 1; break;
+            case STMT_BLOCK: if(_stmt_refs_var(s->as.block.statements,var,vlen)) return 1; break;
+            case STMT_PRINT: if(_expr_refs_var(s->as.print.expression,var,vlen)) return 1; break;
+            case STMT_RAISE: if(_expr_refs_var(s->as.raise.exception,var,vlen)) return 1; break;
+            case STMT_DEFER: if(_stmt_refs_var(s->as.defer.statement,var,vlen)) return 1; break;
+            case STMT_MATCH:
+                if(_expr_refs_var(s->as.match_stmt.value,var,vlen)) return 1;
+                for(int i=0;i<s->as.match_stmt.case_count;i++)
+                    if(s->as.match_stmt.cases && s->as.match_stmt.cases[i] && _stmt_refs_var(s->as.match_stmt.cases[i]->body,var,vlen)) return 1;
+                if(_stmt_refs_var(s->as.match_stmt.default_case,var,vlen)) return 1;
+                break;
+            case STMT_TRY:
+                if(_stmt_refs_var(s->as.try_stmt.try_block,var,vlen)) return 1;
+                if(s->as.try_stmt.catches)
+                    for(int i=0;i<s->as.try_stmt.catch_count;i++)
+                        if(s->as.try_stmt.catches[i] && _stmt_refs_var(s->as.try_stmt.catches[i]->body,var,vlen)) return 1;
+                if(_stmt_refs_var(s->as.try_stmt.finally_block,var,vlen)) return 1;
+                break;
+            default: break;
+        }
+    }
+    return 0;
+}
+// Returns 1 if var_name appears in any class method body or top-level proc body
+static int _var_used_before_main(Stmt* program, const char* var, int vlen) {
+    for (Stmt* s = program; s; s = s->next) {
+        if (s->type == STMT_CLASS) {
+            // Scan all method bodies (methods is a linked list of STMT_PROC)
+            for (Stmt* m = s->as.class_stmt.methods; m; m = m->next) {
+                if (m->type == STMT_PROC || m->type == STMT_ASYNC_PROC) {
+                    ProcStmt* ps = (m->type==STMT_PROC)?&m->as.proc:&m->as.async_proc;
+                    if (_stmt_refs_var(ps->body, var, vlen)) return 1;
+                }
+            }
+        }
+        if (s->type == STMT_PROC || s->type == STMT_ASYNC_PROC) {
+            ProcStmt* ps = (s->type==STMT_PROC)?&s->as.proc:&s->as.async_proc;
+            if (_stmt_refs_var(ps->body, var, vlen)) return 1;
+        }
+    }
+    return 0;
+}
+
+// ── Recursion-cycle detection ─────────────────────────────────────────────
+// Returns 1 if expr `e` contains a direct call whose callee is the bare name
+// `name` (length `len`). Walks the common nesting positions; missing an exotic
+// position only risks under-detection (a genuinely recursive proc left
+// unguarded), never mis-compilation.
+static int _expr_calls_name(Expr* e, const char* name, int len) {
+    if (!e) return 0;
+    switch (e->type) {
+        case EXPR_CALL: {
+            Expr* c = e->as.call.callee;
+            if (c && c->type == EXPR_VARIABLE &&
+                (int)c->as.variable.name.length == len &&
+                memcmp(c->as.variable.name.start, name, len) == 0) return 1;
+            if (_expr_calls_name(e->as.call.callee, name, len)) return 1;
+            for (int i = 0; i < e->as.call.arg_count; i++)
+                if (_expr_calls_name(e->as.call.args[i], name, len)) return 1;
+            return 0;
+        }
+        case EXPR_BINARY:
+            return _expr_calls_name(e->as.binary.left, name, len) ||
+                   _expr_calls_name(e->as.binary.right, name, len);
+        case EXPR_GET:   return _expr_calls_name(e->as.get.object, name, len);
+        case EXPR_SET:   return _expr_calls_name(e->as.set.object, name, len) ||
+                                _expr_calls_name(e->as.set.value, name, len);
+        case EXPR_INDEX: return _expr_calls_name(e->as.index.array, name, len) ||
+                                _expr_calls_name(e->as.index.index, name, len);
+        case EXPR_INDEX_SET:
+            return _expr_calls_name(e->as.index_set.array, name, len) ||
+                   _expr_calls_name(e->as.index_set.index, name, len) ||
+                   _expr_calls_name(e->as.index_set.value, name, len);
+        case EXPR_SLICE: return _expr_calls_name(e->as.slice.array, name, len) ||
+                                _expr_calls_name(e->as.slice.start, name, len) ||
+                                _expr_calls_name(e->as.slice.end, name, len);
+        case EXPR_ARRAY: {
+            for (int i = 0; i < e->as.array.count; i++)
+                if (_expr_calls_name(e->as.array.elements[i], name, len)) return 1;
+            return 0;
+        }
+        case EXPR_TUPLE: {
+            for (int i = 0; i < e->as.tuple.count; i++)
+                if (_expr_calls_name(e->as.tuple.elements[i], name, len)) return 1;
+            return 0;
+        }
+        case EXPR_DICT: {
+            for (int i = 0; i < e->as.dict.count; i++)
+                if (_expr_calls_name(e->as.dict.values[i], name, len)) return 1;
+            return 0;
+        }
+        case EXPR_RANGE: return _expr_calls_name(e->as.range.low, name, len) ||
+                                _expr_calls_name(e->as.range.high, name, len);
+        case EXPR_AWAIT: return _expr_calls_name(e->as.await.expression, name, len);
+        case EXPR_FORCE_UNWRAP:
+        case EXPR_PROPAGATE: return _expr_calls_name(e->as.unwrap.operand, name, len);
+        case EXPR_NULLCOAL: return _expr_calls_name(e->as.nullcoal.left, name, len) ||
+                                   _expr_calls_name(e->as.nullcoal.right, name, len);
+        case EXPR_OPTCHAIN: return _expr_calls_name(e->as.optchain.object, name, len);
+        default: return 0;
+    }
+}
+static int _stmt_calls_name(Stmt* s, const char* name, int len) {
+    for (; s; s = s->next) {
+        switch (s->type) {
+            case STMT_EXPRESSION: if (_expr_calls_name(s->as.expression, name, len)) return 1; break;
+            case STMT_LET:        if (_expr_calls_name(s->as.let.initializer, name, len)) return 1; break;
+            case STMT_RETURN:     if (s->as.ret.value && _expr_calls_name(s->as.ret.value, name, len)) return 1; break;
+            case STMT_PRINT:      if (_expr_calls_name(s->as.print.expression, name, len)) return 1; break;
+            case STMT_RAISE:      if (_expr_calls_name(s->as.raise.exception, name, len)) return 1; break;
+            case STMT_IF:
+                if (_expr_calls_name(s->as.if_stmt.condition, name, len)) return 1;
+                if (_stmt_calls_name(s->as.if_stmt.then_branch, name, len)) return 1;
+                if (_stmt_calls_name(s->as.if_stmt.else_branch, name, len)) return 1;
+                break;
+            case STMT_WHILE:
+                if (_expr_calls_name(s->as.while_stmt.condition, name, len)) return 1;
+                if (_stmt_calls_name(s->as.while_stmt.body, name, len)) return 1;
+                break;
+            case STMT_FOR:
+                if (_expr_calls_name(s->as.for_stmt.iterable, name, len)) return 1;
+                if (_stmt_calls_name(s->as.for_stmt.body, name, len)) return 1;
+                break;
+            case STMT_BLOCK:      if (_stmt_calls_name(s->as.block.statements, name, len)) return 1; break;
+            case STMT_DEFER:      if (_stmt_calls_name(s->as.defer.statement, name, len)) return 1; break;
+            case STMT_MATCH:
+                if (_expr_calls_name(s->as.match_stmt.value, name, len)) return 1;
+                for (int i = 0; i < s->as.match_stmt.case_count; i++)
+                    if (s->as.match_stmt.cases && s->as.match_stmt.cases[i] &&
+                        _stmt_calls_name(s->as.match_stmt.cases[i]->body, name, len)) return 1;
+                if (_stmt_calls_name(s->as.match_stmt.default_case, name, len)) return 1;
+                break;
+            case STMT_TRY:
+                if (_stmt_calls_name(s->as.try_stmt.try_block, name, len)) return 1;
+                if (s->as.try_stmt.catches)
+                    for (int i = 0; i < s->as.try_stmt.catch_count; i++)
+                        if (s->as.try_stmt.catches[i] &&
+                            _stmt_calls_name(s->as.try_stmt.catches[i]->body, name, len)) return 1;
+                if (_stmt_calls_name(s->as.try_stmt.finally_block, name, len)) return 1;
+                break;
+            default: break;
+        }
+    }
+    return 0;
+}
+// Build the call graph over top-level procs and mark every proc that can reach
+// itself (direct self-recursion or a mutual-recursion cycle). Only those procs
+// get a runtime depth guard, so leaf/non-recursive calls stay overhead-free.
+static void aot_detect_recursion(AotCompiler* aot, Stmt* program) {
+    enum { MAXP = 256 };
+    char names[MAXP][64];
+    Stmt* pstmt[MAXP];
+    int np = 0;
+    for (Stmt* s = program; s && np < MAXP; s = s->next) {
+        if (s->type == STMT_PROC || s->type == STMT_ASYNC_PROC) {
+            ProcStmt* ps = (s->type == STMT_PROC) ? &s->as.proc : &s->as.async_proc;
+            int len = ps->name.length < 63 ? ps->name.length : 63;
+            memcpy(names[np], ps->name.start, len); names[np][len] = '\0';
+            pstmt[np] = s;
+            np++;
+        }
+    }
+    if (np == 0) return;
+    unsigned char* reach = (unsigned char*)calloc((size_t)np * np, 1);
+    if (!reach) return;
+    for (int i = 0; i < np; i++) {
+        ProcStmt* ps = (pstmt[i]->type == STMT_PROC) ? &pstmt[i]->as.proc : &pstmt[i]->as.async_proc;
+        for (int j = 0; j < np; j++)
+            if (_stmt_calls_name(ps->body, names[j], (int)strlen(names[j])))
+                reach[i * np + j] = 1;
+    }
+    // Transitive closure (Floyd–Warshall over the reachability relation).
+    for (int k = 0; k < np; k++)
+        for (int i = 0; i < np; i++)
+            if (reach[i * np + k])
+                for (int j = 0; j < np; j++)
+                    if (reach[k * np + j]) reach[i * np + j] = 1;
+    for (int i = 0; i < np; i++)
+        if (reach[i * np + i] && aot->recursive_proc_count < 256)
+            snprintf(aot->recursive_procs[aot->recursive_proc_count++], 64, "%s", names[i]);
+    free(reach);
+}
+static int aot_is_recursive_proc(AotCompiler* aot, Token name) {
+    int len = name.length;
+    for (int i = 0; i < aot->recursive_proc_count; i++)
+        if ((int)strlen(aot->recursive_procs[i]) == len &&
+            memcmp(aot->recursive_procs[i], name.start, len) == 0) return 1;
+    return 0;
+}
+
 char* aot_compile_program(AotCompiler* aot, Stmt* program) {
+    // Treat macro definitions as plain procs (matches interpreter semantics).
+    // MacroDefStmt and ProcStmt share name/params/param_count/body, so we read
+    // the macro fields into locals first, then overwrite the union as a proc.
+    for (Stmt* s = program; s; s = s->next) {
+        if (s->type == STMT_MACRO_DEF) {
+            Token  m_name   = s->as.macro_def.name;
+            Token* m_params = s->as.macro_def.params;
+            int    m_pc     = s->as.macro_def.param_count;
+            Stmt*  m_body   = s->as.macro_def.body;
+            s->type = STMT_PROC;
+            ProcStmt* p = &s->as.proc;
+            p->name = m_name;
+            p->params = m_params;
+            p->param_types = NULL;
+            p->defaults = NULL;
+            p->param_count = m_pc;
+            p->required_count = m_pc;
+            p->return_type = NULL;
+            p->doc = NULL;
+            p->type_params = NULL;
+            p->type_param_count = 0;
+            p->body = m_body;
+        }
+    }
     aot_infer_types(aot,program);
+    aot_detect_recursion(aot, program);
+    // Record doc comments for compile-time doc() resolution.
+    for (Stmt* s = program; s; s = s->next) {
+        if ((s->type == STMT_PROC || s->type == STMT_ASYNC_PROC) && aot->proc_doc_count < 256) {
+            ProcStmt* ps = (s->type==STMT_PROC)?&s->as.proc:&s->as.async_proc;
+            int len = ps->name.length < 63 ? ps->name.length : 63;
+            memcpy(aot->proc_docs[aot->proc_doc_count].name, ps->name.start, len);
+            aot->proc_docs[aot->proc_doc_count].name[len] = '\0';
+            aot->proc_docs[aot->proc_doc_count].doc = ps->doc;  // may be NULL
+            aot->proc_doc_count++;
+        }
+    }
     aot_emit(aot,"/* Auto-generated by sage --aot */");
     aot_emit(aot,"#define _POSIX_C_SOURCE 200809L");
     aot_emit(aot,"#define _GNU_SOURCE");
@@ -2954,6 +4467,10 @@ char* aot_compile_program(AotCompiler* aot, Stmt* program) {
     for (Stmt* s = program; s; s = s->next) {
         if (s->type == STMT_PROC || s->type == STMT_ASYNC_PROC) {
             ProcStmt* ps = (s->type==STMT_PROC)?&s->as.proc:&s->as.async_proc;
+            // Generic procs have dynamic (SageValue) params regardless of call-site
+            // arg types — collecting per-call types here would wrongly specialize
+            // them (e.g. identity(10) typing param 0 as INT, breaking identity("x")).
+            if (ps->type_param_count > 0) continue;
             aot_collect_calls(aot, ps->name.start, ps->name.length, program);
         }
         // Also collect call-site info for class constructors
@@ -2974,8 +4491,9 @@ char* aot_compile_program(AotCompiler* aot, Stmt* program) {
             char* name = aot_cname_tok(ps->name);
             aot_emit(aot, "static SageValue %s(", name);
             aot->indent++;
+            int fwd_is_generic = (ps->type_param_count > 0);
             for (int i = 0; i < ps->param_count; i++) {
-                JitTypeTag pt = aot_param_type(aot, ps->name.start, ps->name.length, i);
+                JitTypeTag pt = fwd_is_generic ? JIT_TYPE_UNKNOWN : aot_param_type(aot, ps->name.start, ps->name.length, i);
                 aot_emit(aot, "%s%s",
                     jit_is_unboxed(pt) ? jit_ctype(pt) : "SageValue",
                     i < ps->param_count-1 ? "," : "");
@@ -2986,50 +4504,387 @@ char* aot_compile_program(AotCompiler* aot, Stmt* program) {
         }
     }
     aot_blank(aot);
-    // ── Process imports at file scope (before main) ────────────────────────
-    // This ensures module procs/classes are emitted as file-scope statics
-    for(Stmt*s=program;s;s=s->next)
-        if(s->type==STMT_IMPORT)
-            aot_compile_stmt(aot,s);
-    aot_blank(aot);
-    // Structs/enums/classes/impls
-    for(Stmt*s=program;s;s=s->next)
-        if(s->type==STMT_STRUCT||s->type==STMT_ENUM||s->type==STMT_CLASS||s->type==STMT_IMPL)
-            aot_compile_stmt(aot,s);
-    aot_blank(aot);
-    // Nested proc wrappers (hoisted file-scope functions for closures)
-    for(Stmt*s=program;s;s=s->next)
-        if(s->type==STMT_PROC||s->type==STMT_ASYNC_PROC){
-            ProcStmt*ps=(s->type==STMT_PROC)?&s->as.proc:&s->as.async_proc;
-            aot_emit_nested_procs(aot,ps->body);
+    // Stub declarations for interpreter-only threading/asm modules
+    // Only emit if the module can't be found (prevents conflicts with actual module imports)
+    {
+        // Modules that should always use stubs regardless of whether a .sage file exists.
+        // Reason: the .sage file uses reserved keywords as proc names (e.g. thread.sage has
+        // "proc spawn" but "spawn" is TOKEN_SPAWN), or are pure native-only modules.
+        const char* _force_stub[] = {
+            "thread","mutex","atomic","channel","sys","gc","python","ffi",
+            "semaphore","rwlock","condvar","signal","socket","io",NULL
+        };
+        const char* _stub_names[] = {
+            "thread","mutex","semaphore","rwlock","condvar","signal","asm","sys",
+            "python","addressof","channel","socket","io","atomic","gc",NULL
+        };
+        for (int _si=0; _stub_names[_si]; _si++) {
+            // Check if this is a force-stubbed module (ignore real .sage file)
+            int _force = 0;
+            for (int _fi=0; _force_stub[_fi]; _fi++)
+                if (strcmp(_stub_names[_si], _force_stub[_fi])==0) { _force=1; break; }
+            // Check if there's an actual importable module with this name
+            char* _mod_path = (!_force && global_module_cache) ? resolve_module_path(global_module_cache, _stub_names[_si]) : NULL;
+            if (!_mod_path) {
+                // No real module — emit stub
+                char _sv[32]; snprintf(_sv, sizeof(_sv), "sg_%s", _stub_names[_si]);
+                aot_emit(aot,"static SageValue %s; /* interpreter-only stub */",_sv);
+                aot_set_var_type(aot, _stub_names[_si], JIT_TYPE_DICT);
+            } else {
+                free(_mod_path);
+            }
         }
+    }
+    // Pre-emit stubs for force-skipped native modules (thread, channel, atomic, gc)
+    // These modules have .sage files but they use reserved keywords — we skip loading them
+    // and emit stubs directly here before any import processing.
+    {
+        static const struct { const char* mod; const char* fn; int na; } _nat_stubs[] = {
+            // thread module (spawn emitted separately as variadic)
+            {"thread","join",1},
+            {"thread","sleep",1},{"thread","yield",0},{"thread","mutex",0},
+            {"thread","lock",1},{"thread","unlock",1},{"thread","try_lock",1},
+            // channel module (skip channel.sage which also uses reserved words)
+            {"channel","new",0},{"channel","send",2},{"channel","recv",1},
+            {"channel","try_recv",1},{"channel","close",1},{"channel","is_closed",1},
+            {"channel","len",1},{"channel","select",1},
+            // atomic module
+            {"atomic","new",1},{"atomic","load",1},{"atomic","store",2},
+            {"atomic","add",2},{"atomic","sub",2},{"atomic","cas",3},{"atomic","exchange",2},
+            // mutex module
+            {"mutex","new",0},{"mutex","lock",1},{"mutex","unlock",1},{"mutex","try_lock",1},
+            {NULL,NULL,0}
+        };
+        // Register native module vars as dict stubs
+        static const char* _nat_mods[] = {"thread","channel","atomic","mutex",NULL};
+        for(int _mi=0; _nat_mods[_mi]; _mi++){
+            char _sv[32]; snprintf(_sv,sizeof(_sv),"sg_%s",_nat_mods[_mi]);
+            aot_emit(aot,"static SageValue %s;",_sv);
+            aot_set_var_type(aot,_nat_mods[_mi],JIT_TYPE_DICT);
+        }
+        // Emit stub functions. atomic/channel map to real runtime functions;
+        // thread/mutex remain nil stubs (no real threading in AOT — async runs
+        // synchronously, so these are not exercised concurrently).
+        for(int _si=0; _nat_stubs[_si].mod; _si++){
+            char sfn[128]; snprintf(sfn,sizeof(sfn),"sg_%s_sg_%s",_nat_stubs[_si].mod,_nat_stubs[_si].fn);
+            int na=_nat_stubs[_si].na;
+            const char* body = NULL;  // when set, the C body that returns a value
+            const char* m=_nat_stubs[_si].mod; const char* f=_nat_stubs[_si].fn;
+            if(!strcmp(m,"atomic")){
+                if(!strcmp(f,"new"))      body="return sage_rt_atomic_new(_a);";
+                else if(!strcmp(f,"load"))body="return sage_rt_atomic_load(_a);";
+                else if(!strcmp(f,"store"))body="return sage_rt_atomic_store(_a,_b);";
+                else if(!strcmp(f,"add")) body="return sage_rt_atomic_add(_a,_b);";
+                else if(!strcmp(f,"sub")) body="return sage_rt_atomic_sub(_a,_b);";
+                else if(!strcmp(f,"cas")) body="return sage_rt_atomic_cas(_a,_b,_c);";
+                else if(!strcmp(f,"exchange"))body="return sage_rt_atomic_exchange(_a,_b);";
+            } else if(!strcmp(m,"channel")){
+                if(!strcmp(f,"new"))      body="return sage_rt_channel_new();";
+                else if(!strcmp(f,"send"))body="return sage_rt_channel_send(_a,_b);";
+                else if(!strcmp(f,"recv"))body="return sage_rt_channel_recv(_a);";
+                else if(!strcmp(f,"try_recv"))body="return sage_rt_channel_try_recv(_a);";
+                else if(!strcmp(f,"close"))body="return sage_rt_channel_close(_a);";
+                else if(!strcmp(f,"is_closed"))body="return sage_rt_channel_is_closed(_a);";
+                else if(!strcmp(f,"len")) body="return sage_rt_channel_len(_a);";
+            } else if(!strcmp(m,"thread")){
+                // Synchronous model: spawn runs the proc immediately and join
+                // returns the already-computed result unchanged.
+                if(!strcmp(f,"join")) body="return _a;";
+            }
+            if(!body) body = "return sage_rt_nil();";
+            if(na==0) aot_emit(aot,"static SageValue %s(void){%s}",sfn,body);
+            else if(na==1) aot_emit(aot,"static SageValue %s(SageValue _a){(void)_a;%s}",sfn,body);
+            else if(na==2) aot_emit(aot,"static SageValue %s(SageValue _a,SageValue _b){(void)_a;(void)_b;%s}",sfn,body);
+            else aot_emit(aot,"static SageValue %s(SageValue _a,SageValue _b,SageValue _c){(void)_a;(void)_b;(void)_c;%s}",sfn,body);
+            aot_register_proc(aot,sfn);
+        }
+        // thread.id() needs to return a positive integer (like a thread id)
+        aot_emit(aot,"static SageValue sg_thread_sg_id(void){return sage_rt_int(1);}");
+        aot_register_proc(aot,"sg_thread_sg_id");
+        // thread.spawn(fn, ...args): synchronous — call fn now, return its result
+        // (a resolved "future"). join() then returns it unchanged.
+        aot_emit(aot,"static SageValue sg_thread_sg_spawn(int _argc, SageValue* _argv){");
+        aot_emit(aot,"    if(_argc<1) return sage_rt_nil();");
+        aot_emit(aot,"    return sage_rt_call_fn(_argv[0], _argc-1, _argv+1);");
+        aot_emit(aot,"}");
+        aot_register_proc(aot,"sg_thread_sg_spawn");
+    }
+    // Global builtin function stubs for interpreter-only features (ffi, gc builtins, etc.)
+    {
+        static const struct { const char* fn; int nargs; } _gstubs[] = {
+            // FFI bare functions  
+            {"ffi_open",1},{"ffi_close",1},{"ffi_sym",2},
+            // gc builtins  
+            {"gc_disable",0},{"gc_enable",0},{"gc_collect",0},
+            {"gc_collections",0},{"gc_alloc_count",0},
+            // semaphore bare functions
+            {"sem_new",1},{"sem_wait",1},{"sem_post",1},{"sem_destroy",1},{"sem_trywait",1},
+            // memory/pointer functions
+            {"ptr_add",2},{"ptr_sub",2},{"ptr_deref",1},
+            // cpu/smp functions
+            {"cpu_count",0},{"cpu_has_hyperthreading",0},{"cpu_physical_cores",0},
+            {"cpu_logical_cores",0},{"smp_count",0},{"smp_id",0},
+            // doc() builtin - returns docstring of a proc (always nil in AOT mode)
+            {"doc",1},
+            // path_* bare global functions
+            {"path_join",3},{"path_dirname",1},{"path_basename",1},
+            {"path_ext",1},{"path_stem",1},{"path_exists",1},
+            // regex bare functions (stop_pos is a local var in regex module, not a function)
+            {"re_match",2},{"re_find",2},{"re_replace",3},{"re_split",2},
+            // sizeof bare
+            {"sizeof",1},
+            // timed macro stub
+            {"timed",1},{"profile_start",1},{"profile_end",1},
+            // bytes global functions
+            {"bytes",1},{"bytes_len",1},{"bytes_get",2},{"bytes_set",3},
+            {"bytes_to_string",1},{"bytes_slice",3},{"bytes_from_string",1},
+            {NULL,0}
+        };
+        for (int _gi=0; _gstubs[_gi].fn; _gi++) {
+            const char* fn = _gstubs[_gi].fn;
+            int na = _gstubs[_gi].nargs;
+            char sfn[64]; snprintf(sfn,sizeof(sfn),"sg_%s",fn);
+            // Don't emit a nil stub for a name the user has defined as a proc
+            // (e.g. a `macro timed(...)` rewritten to a proc) — that would
+            // produce a conflicting redefinition.
+            if (aot_is_known_proc(aot, sfn, (int)strlen(sfn))) continue;
+            const char* body = NULL;
+            if(!strcmp(fn,"sem_new"))          body="return sage_rt_sem_new(_a);";
+            else if(!strcmp(fn,"sem_wait"))    body="return sage_rt_sem_wait(_a);";
+            else if(!strcmp(fn,"sem_post"))    body="return sage_rt_sem_post(_a);";
+            else if(!strcmp(fn,"sem_trywait")) body="return sage_rt_sem_trywait(_a);";
+            else if(!strcmp(fn,"cpu_count")||!strcmp(fn,"cpu_logical_cores")||!strcmp(fn,"smp_count"))
+                                               body="return sage_rt_cpu_count();";
+            else if(!strcmp(fn,"cpu_physical_cores")) body="return sage_rt_cpu_physical_cores();";
+            else if(!strcmp(fn,"cpu_has_hyperthreading")) body="return sage_rt_cpu_has_hyperthreading();";
+            else if(!strcmp(fn,"gc_collections")||!strcmp(fn,"gc_alloc_count")) body="return sage_rt_gc_collections();";
+            if(body){
+                if(na==0) aot_emit(aot,"static SageValue %s(void){%s}",sfn,body);
+                else aot_emit(aot,"static SageValue %s(SageValue _a){(void)_a;%s}",sfn,body);
+                aot_register_proc(aot, sfn); aot_register_proc(aot, fn);
+                continue;
+            }
+            if (na==0) aot_emit(aot,"static SageValue %s(void){return sage_rt_nil();}",sfn);
+            else if(na==1) aot_emit(aot,"static SageValue %s(SageValue _a){(void)_a;return sage_rt_nil();}",sfn);
+            else if(na==2) aot_emit(aot,"static SageValue %s(SageValue _a,SageValue _b){(void)_a;(void)_b;return sage_rt_nil();}",sfn);
+            else if(na==3) aot_emit(aot,"static SageValue %s(SageValue _a,SageValue _b,SageValue _c){(void)_a;(void)_b;(void)_c;return sage_rt_nil();}",sfn);
+            else aot_emit(aot,"static SageValue %s(SageValue _a,SageValue _b,SageValue _c,SageValue _d){(void)_a;(void)_b;(void)_c;(void)_d;return sage_rt_nil();}",sfn);
+            aot_register_proc(aot, sfn);
+            aot_register_proc(aot, fn);
+        }
+        // ffi_call is variadic — emit as SageNativeFn-compatible  
+        aot_emit(aot,"static SageValue sg_ffi_call(SageValue _a,...){(void)_a;return sage_rt_nil();}");
+        aot_register_proc(aot,"sg_ffi_call"); aot_register_proc(aot,"ffi_call");
+    }
+    // Pre-declare commonly-needed native module stub functions so modules that
+    // import sys/socket/etc internally don't get implicit-int returns
+    {
+        static const struct { const char* cname; int na; } _fwdecls[] = {
+            // sys module functions
+            {"sg_sys_sg_args",0},{"sg_sys_sg_exit",1},{"sg_sys_sg_getenv",1},
+            {"sg_sys_sg_setenv",2},{"sg_sys_sg_getcwd",0},{"sg_sys_sg_time",0},
+            {"sg_sys_sg_clock",0},{"sg_sys_sg_sleep",1},
+            // signal module (std.signal)
+            {"sg_signal_sg_on",2},{"sg_signal_sg_emit",1},{"sg_signal_sg_off",2},
+            // db module
+            {"sg_std_db_sg_open",1},{"sg_std_db_sg_execute",2},{"sg_std_db_sg_query",2},
+            {"sg_std_db_sg_close",1},{"sg_std_db_sg_fetch_one",1},{"sg_std_db_sg_fetch_all",1},
+            {NULL,0}
+        };
+        for(int _fi=0; _fwdecls[_fi].cname; _fi++){
+            const char* _cn = _fwdecls[_fi].cname;
+            int _na = _fwdecls[_fi].na;
+            if(_na==0) aot_emit(aot,"static SageValue %s(void){return sage_rt_nil();}",_cn);
+            else if(_na==1) aot_emit(aot,"static SageValue %s(SageValue _a){(void)_a;return sage_rt_nil();}",_cn);
+            else aot_emit(aot,"static SageValue %s(SageValue _a,SageValue _b){(void)_a;(void)_b;return sage_rt_nil();}",_cn);
+            aot_register_proc(aot,_cn);
+        }
+    }
+    // Note: _mwrap_ wrappers for global stubs (bytes, hash, doc, sizeof) are generated
+    // lazily by the _mwrap_ generation pass for top-level procs, so no explicit emission needed here.
+    // Recursively scan ALL stmts (including nested proc bodies) for imports
+    // so imports inside proc bodies (e.g. assert.sage `import math`) are handled
+    {
+        // Use a stack-based iterative scan to find all STMT_IMPORT nodes
+        Stmt* scan_queue[512]; int sq_head=0, sq_tail=0;
+        for(Stmt*s=program;s;s=s->next) if(sq_tail<512) scan_queue[sq_tail++]=s;
+        while(sq_head<sq_tail){
+            Stmt* s=scan_queue[sq_head++];
+            if(s->type==STMT_IMPORT) aot_compile_stmt(aot,s);
+            // Recurse into proc/async proc bodies
+            if((s->type==STMT_PROC||s->type==STMT_ASYNC_PROC)){
+                ProcStmt* ps=(s->type==STMT_PROC)?&s->as.proc:&s->as.async_proc;
+                for(Stmt*b=ps->body;b&&sq_tail<512;b=b->next) scan_queue[sq_tail++]=b;
+            }
+            if(s->type==STMT_BLOCK) for(Stmt*b=s->as.block.statements;b&&sq_tail<512;b=b->next) scan_queue[sq_tail++]=b;
+            if(s->type==STMT_IF){for(Stmt*b=s->as.if_stmt.then_branch;b&&sq_tail<512;b=b->next)scan_queue[sq_tail++]=b;for(Stmt*b=s->as.if_stmt.else_branch;b&&sq_tail<512;b=b->next)scan_queue[sq_tail++]=b;}
+            if(s->type==STMT_WHILE) for(Stmt*b=s->as.while_stmt.body;b&&sq_tail<512;b=b->next) scan_queue[sq_tail++]=b;
+            if(s->type==STMT_FOR) for(Stmt*b=s->as.for_stmt.body;b&&sq_tail<512;b=b->next) scan_queue[sq_tail++]=b;
+        }
+    }
     aot_blank(aot);
-    // Procs
+    // Pre-declare top-level vars as file-scope C globals ONLY when they are
+    // referenced in class method or top-level proc bodies (compiled before main).
+    // Other vars stay as typed locals in main() for performance.
+    for (Stmt* s = program; s; s = s->next) {
+        if (s->type == STMT_LET && s->as.let.name.start) {
+            const char* vstart = s->as.let.name.start;
+            int vlen = s->as.let.name.length;
+            if (!_var_used_before_main(program, vstart, vlen)) continue;
+            char* vn = aot_cname_tok(s->as.let.name);
+            char raw_n[64]; int rl = vlen<63?vlen:63;
+            memcpy(raw_n, vstart, rl); raw_n[rl] = '\0';
+            aot_emit(aot, "static SageValue %s = {0}; /* toplevel global */", vn);
+            aot_set_var_type(aot, raw_n, JIT_TYPE_UNKNOWN);
+            if (aot->global_var_count < 128)
+                snprintf(aot->global_vars[aot->global_var_count++], 64, "%s", vn);
+            free(vn);
+        } else if (s->type == STMT_COMPTIME) {
+            Stmt* _ct = s->as.comptime.body;
+            if (_ct && _ct->type == STMT_BLOCK) _ct = _ct->as.block.statements;
+            for (Stmt* cs = _ct; cs; cs = cs->next) {
+                if (cs->type == STMT_LET && cs->as.let.name.start) {
+                    const char* vstart2 = cs->as.let.name.start;
+                    int vlen2 = cs->as.let.name.length;
+                    if (!_var_used_before_main(program, vstart2, vlen2)) continue;
+                    char* vn = aot_cname_tok(cs->as.let.name);
+                    char raw_n2[64]; int rl2 = vlen2<63?vlen2:63;
+                    memcpy(raw_n2, vstart2, rl2); raw_n2[rl2] = '\0';
+                    aot_emit(aot, "static SageValue %s = {0}; /* toplevel global */", vn);
+                    aot_set_var_type(aot, raw_n2, JIT_TYPE_UNKNOWN);
+                    if (aot->global_var_count < 128)
+                        snprintf(aot->global_vars[aot->global_var_count++], 64, "%s", vn);
+                    free(vn);
+                }
+            }
+        }
+    }
+    aot_blank(aot);
+    // Forward-declare class constructors so methods can call them
+    for(Stmt*s=program;s;s=s->next) {
+        if(s->type==STMT_CLASS) {
+            ClassStmt* cs = &s->as.class_stmt;
+            char* cname = aot_cname_tok(cs->name);
+            // Count init params — only look at this class's own init
+            int np = -1;  // -1 = no init found
+            for(Stmt*m=cs->methods;m;m=m->next)
+                if(m->type==STMT_PROC && m->as.proc.name.length==4 &&
+                   memcmp(m->as.proc.name.start,"init",4)==0) {
+                    np = 0;
+                    for(int i=0;i<m->as.proc.param_count;i++)
+                        if(m->as.proc.params[i].length!=4||memcmp(m->as.proc.params[i].start,"self",4)!=0) np++;
+                    break;
+                }
+            if (np < 0) {
+                // No own init — skip forward decl (constructor comes from parent or is variadic)
+                // The actual constructor will be emitted during class compilation
+                free(cname); continue;
+            }
+            // Forward declare constructor with known param count
+            char pbuf[512]=""; int pp=0;
+            for(int i=0;i<np;i++) pp+=snprintf(pbuf+pp,sizeof(pbuf)-pp,"%sSageValue",i?",":"");
+            if(np==0) aot_emit(aot,"static SageValue %s(void);",cname);
+            else aot_emit(aot,"static SageValue %s(%s);",cname,pbuf);
+            free(cname);
+        }
+    }
+    aot_blank(aot);
+    // Structs/enums/classes/impls/traits
+    for(Stmt*s=program;s;s=s->next)
+        if(s->type==STMT_STRUCT||s->type==STMT_ENUM||s->type==STMT_CLASS||s->type==STMT_IMPL||s->type==STMT_TRAIT)
+            aot_compile_stmt(aot,s);
+    aot_blank(aot);
+    // Procs (aot_emit_proc calls aot_emit_nested_procs internally — no pre-pass needed)
     for(Stmt*s=program;s;s=s->next)
         if(s->type==STMT_PROC||s->type==STMT_ASYNC_PROC)
             aot_emit_proc(aot,s);
+    // Emit SageNativeFn-compatible wrappers for top-level procs so they can be
+    // passed as values to higher-order functions (arrays.map, arrays.filter, etc.)
+    aot_blank(aot);
+    for(Stmt*s=program;s;s=s->next) {
+        if(s->type!=STMT_PROC && s->type!=STMT_ASYNC_PROC) continue;
+        ProcStmt* ps=(s->type==STMT_PROC)?&s->as.proc:&s->as.async_proc;
+        if(ps->body && _has_yield(ps->body)) continue; // generators have own wrappers
+        char* fn=aot_cname_tok(ps->name);
+        int np=ps->param_count;
+        // Register _mwrap_ in known_procs so EXPR_VARIABLE can detect it exists
+        {char mwn[128]; snprintf(mwn,sizeof(mwn),"_mwrap_%s",fn); aot_register_proc(aot,mwn);}
+        aot_emit(aot,"static SageValue _mwrap_%s(int _argc, SageValue* _argv, void* _env) {",fn);
+        aot->indent++;
+        aot_emit(aot,"(void)_env;");
+        // Build arg list, unboxing each parameter to match the actual proc signature
+        // For generic procs [T], all params are SageValue — no unboxing
+        int mwrap_is_generic = (ps->type_param_count > 0);
+        char argbuf[1024]=""; int abpos=0;
+        for(int i=0;i<np&&i<16;i++){
+            JitTypeTag pt = mwrap_is_generic ? JIT_TYPE_UNKNOWN : aot_param_type(aot, ps->name.start, ps->name.length, i);
+            char slot[80]; snprintf(slot,sizeof(slot),"(_argc>%d?_argv[%d]:sage_rt_nil())",i,i);
+            char arg[128];
+            if (pt==JIT_TYPE_INT)
+                snprintf(arg,sizeof(arg),"SAGE_AS_INT64(%s)",slot);
+            else if (pt==JIT_TYPE_FLOAT)
+                snprintf(arg,sizeof(arg),"SAGE_AS_DOUBLE(%s)",slot);
+            else if (pt==JIT_TYPE_BOOL)
+                snprintf(arg,sizeof(arg),"sage_rt_truthy(%s)",slot);
+            else if (pt==JIT_TYPE_STRING)
+                snprintf(arg,sizeof(arg),"(SAGE_IS_STRING(%s)?%s.as.string:\"\")",slot,slot);
+            else
+                snprintf(arg,sizeof(arg),"%s",slot);
+            abpos+=snprintf(argbuf+abpos,sizeof(argbuf)-abpos,"%s%s",i?",":"",arg);
+        }
+        aot_emit(aot,"return %s(%s);",fn,argbuf);
+        aot->indent--;
+        aot_emit(aot,"}");
+        free(fn);
+    }
     // Infer types for top-level code before emitting main
     aot_infer_body(aot, program);
     // main
     aot_emit(aot,"int main(int argc, char** argv) {");
     aot->indent++;
     aot_emit(aot,"(void)argc; (void)argv;");
+    // Capture the stack base for the conservative GC stack scan. `argc` lives
+    // near the top of main's frame, so its address approximates the base.
+    aot_emit(aot,"sage_rt_gc_set_stack_base((void*)&argc);");
     aot_emit(aot,"sage_rt_init();");
     // ── Initialize imported module namespace dicts ────────────────────────
     {
         const char* cur_mod = "";
         for (int mi = 0; mi < aot->mod_proc_count; mi++) {
             const char* mcn = aot->mod_procs[mi].mod_cname;
+            const char* wrap = aot->mod_procs[mi].wrap_cname;
+            // Special case: trait definitions — assign directly to sg_TraitName (skip dict_new)
+            if (strcmp(mcn,"__trait__")==0) {
+                if (wrap[0]=='@'&&wrap[1]=='@') {
+                    char trait_var[70]; snprintf(trait_var,sizeof(trait_var),"sg_%s",aot->mod_procs[mi].proc_raw);
+                    aot_emit(aot,"%s = %s;",trait_var,wrap+2);
+                }
+                continue;
+            }
             if (strcmp(mcn, cur_mod) != 0) {
                 aot_emit(aot, "%s = sage_rt_dict_new();", mcn);
                 cur_mod = aot->mod_procs[mi].mod_cname;
             }
-            const char* wrap = aot->mod_procs[mi].wrap_cname;
             if (wrap[0] == '@' && wrap[1] == '@') {
                 // Module variable — value expression follows @@
                 const char* expr_str = wrap + 2;
+                // Export to dict
                 aot_emit(aot, "sage_rt_dict_set(%s, sage_rt_string(\"%s\"), %s);",
                          mcn, aot->mod_procs[mi].proc_raw, expr_str);
+                // Also initialize the corresponding static var used inside module procs
+                // We need to find which module this belongs to and set the prefixed var
+                // Look up prefix from mod_prefix_map using mcn (strip sg_)
+                for (int _pmi=0; _pmi<aot->mod_prefix_map_count; _pmi++) {
+                    char tmp_mcn[64]; snprintf(tmp_mcn,sizeof(tmp_mcn),"sg_%s",aot->mod_prefix_map[_pmi].short_name);
+                    if (strcmp(tmp_mcn, mcn)==0) {
+                        // var name = prefix + sg_ + proc_raw
+                        char* vn_c = aot_cname(aot->mod_procs[mi].proc_raw, strlen(aot->mod_procs[mi].proc_raw));
+                        aot_emit(aot, "%s%s = %s; /* init module static var */",
+                                 aot->mod_prefix_map[_pmi].full_prefix, vn_c, expr_str);
+                        free(vn_c);
+                        break;
+                    }
+                }
             } else if (wrap[0] == '@') {
                 // Legacy single-@ variable reference
                 const char* cvar = wrap + 1;
@@ -3042,6 +4897,14 @@ char* aot_compile_program(AotCompiler* aot, Stmt* program) {
             }
         }
     }
+    // Initialize interpreter-only stub module dicts with real values where possible
+    // sys module: platform, version, args
+    aot_emit(aot,"if(sage_rt_truthy(sg_sys)){} else {");
+    aot_emit(aot,"  sg_sys=sage_rt_dict_new();");
+    aot_emit(aot,"  sage_rt_dict_set(sg_sys,sage_rt_string(\"platform\"),sage_rt_string(\"linux\"));");
+    aot_emit(aot,"  sage_rt_dict_set(sg_sys,sage_rt_string(\"version\"),sage_rt_string(\"%s\"));", SAGE_VERSION_STR ? SAGE_VERSION_STR : "0.2.0");
+    aot_emit(aot,"  sage_rt_dict_set(sg_sys,sage_rt_string(\"os\"),sage_rt_string(\"linux\"));");
+    aot_emit(aot,"}");
     // Register enums as namespace dicts
     for(Stmt*s=program;s;s=s->next){
         if(s->type==STMT_ENUM){

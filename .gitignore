@@ -1,0 +1,20 @@
+# Build artifacts
+obj/
+sage
+*.o
+*.d
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc

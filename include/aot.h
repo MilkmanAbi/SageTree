@@ -43,8 +43,16 @@ typedef struct {
     Stmt* defer_stack[64];
     int defer_count;
     // Known C function names (from STMT_PROC/CLASS declarations) — call directly, not via sage_rt_call_fn
-    char known_procs[256][64];
+    char known_procs[512][64];
     int known_proc_count;
+    // Raw Sage names of top-level procs that participate in a recursive cycle
+    // (direct self-recursion or mutual recursion). Bodies of these procs get a
+    // runtime recursion-depth guard emitted; all other procs stay overhead-free.
+    char recursive_procs[256][64];
+    int recursive_proc_count;
+    // Doc comments per top-level proc (raw name -> docstring) for compile-time doc().
+    struct { char name[64]; char* doc; } proc_docs[256];
+    int proc_doc_count;
     // Class/struct constructor names — always use SageValue params (no type specialization)
     char known_ctors[128][64];
     int known_ctor_count;
@@ -71,6 +79,9 @@ typedef struct {
     // Imported module names (deduplication — each module only compiled once)
     char imported_modules[64][128];
     int  imported_module_count;
+    // Maps short module name → full C prefix (e.g. "atomic" → "sg_std_atomic_")
+    struct { char short_name[64]; char full_prefix[128]; } mod_prefix_map[64];
+    int mod_prefix_map_count;
     // Default parameter registry: maps proc_cname#idx -> default C expression string
     struct { char proc_cname[64]; int param_idx; char default_expr[256]; Expr* default_ast; } proc_defaults[512];
     int proc_default_count;
@@ -81,11 +92,21 @@ typedef struct {
     struct {
         char mod_cname[64];  // e.g. "sg_arrays"
         char proc_raw[64];   // e.g. "map"
-        char wrap_cname[256];// e.g. "_mwrap_sg_arrays_sg_map" or "@@expr" for vars
+        char wrap_cname[1024];// e.g. "_mwrap_sg_arrays_sg_map" or "@@expr" for vars
     } mod_procs[512];
     int mod_proc_count;
     // Current module prefix for name-mangling during module compilation
     char current_module_prefix[128];
+    // Top-level program vars declared as file-scope C globals (before main)
+    // so class methods and procs compiled before main() can reference them
+    char global_vars[128][64];
+    int  global_var_count;
+    // Set to 1 while compiling a proc/method body — STMT_LET inside procs
+    // should declare locals, not assign to globals
+    int  in_proc_body;
+    // Set to 1 while compiling a closure wrapper body (_sw_ functions)
+    // so STMT_LET can #undef capture aliases before redeclaring same names
+    int  in_closure_body;
 } AotCompiler;
 
 // Lifecycle

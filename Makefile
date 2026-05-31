@@ -74,7 +74,7 @@ $(TARGET): $(ALL_OBJ)
 	$(CC) $(CFLAGS) -o $@ $(ALL_OBJ) $(LDFLAGS)
 	@echo "  Built: $(TARGET) ($(SAGE_VERSION))"
 
-obj/%.o: src/%.c | obj
+obj/%.o: src/%.c $(wildcard include/*.h) | obj
 	$(CC) $(CFLAGS) -c $< -o $@
 
 obj/vm/%.o: src/vm/%.c | obj/vm
@@ -103,19 +103,32 @@ test: $(TARGET)
 
 # ── Runtime (IP1-A: compiled Sage binary support) ─────────────────────
 RT_CFLAGS := -O2 -Wall -Wextra -Wno-unused-parameter -std=c11 \
-             -Iruntime -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE
+             -Iruntime -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE \
+             $(LIBFFI_CFLAGS) $(if $(strip $(LIBFFI_LDFLAGS)),-DSAGE_HAS_FFI,)
+# Python runtime FFI (optional): compiled into the runtime archive when the
+# Python dev headers are present. Programs that use it must link Python too.
+PYRT_INCLUDES := $(shell python3-config --includes 2>/dev/null)
+ifneq ($(strip $(PYRT_INCLUDES)),)
+    PYRT_CFLAGS := $(PYRT_INCLUDES) -DSAGE_HAS_PYRT
+else
+    PYRT_CFLAGS :=
+endif
 RT_SRC    := runtime/sage_runtime.c
 RT_OBJ    := obj/rt/sage_runtime.o
+PYRT_OBJ  := obj/rt/sage_py_rt.o
 RT_LIB    := obj/rt/libsage_runtime.a
 
 runtime: $(RT_LIB)
 	@echo "  Built: $(RT_LIB)"
 
-$(RT_LIB): $(RT_OBJ) | obj/rt
+$(RT_LIB): $(RT_OBJ) $(PYRT_OBJ) | obj/rt
 	ar rcs $@ $^
 
 $(RT_OBJ): $(RT_SRC) runtime/sage_runtime.h | obj/rt
 	$(CC) $(RT_CFLAGS) -c $< -o $@
+
+$(PYRT_OBJ): runtime/sage_py_rt.c runtime/sage_runtime.h | obj/rt
+	$(CC) -O2 -std=c11 -Iruntime -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE $(PYRT_CFLAGS) -c $< -o $@
 
 obj/rt:
 	@mkdir -p obj/rt

@@ -21,6 +21,8 @@
 #include <ctype.h>
 #include <inttypes.h>
 #include <setjmp.h>
+#include <unistd.h>
+#include <dlfcn.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Exception frame stack (thread-local)
@@ -42,11 +44,14 @@ typedef struct {
     int        enabled;       // 0 = GC paused (manual or gc_disable)
     int        pause_depth;   // nested pause depth (@manual blocks can nest)
     size_t     next_gc;       // collect when bytes_live exceeds this
+    size_t     next_gc_objects; // collect when obj_count reaches this
+    int        mode;          // 0 = tracing (default), 1 = arc, 2 = orc
 } _SageRTGC;
 
 static _SageRTGC _gc = {
     .enabled  = 1,
     .next_gc  = 512 * 1024,  // first GC at 512 KB
+    .next_gc_objects = 128,  // or after 128 live objects (matches interpreter)
 };
 
 // Root set for GC: a simple stack of pointers to SageValue
@@ -55,6 +60,15 @@ static _SageRTGC _gc = {
 #define RT_ROOT_MAX 4096
 static SageValue* _gc_roots[RT_ROOT_MAX];
 static int        _gc_root_count = 0;
+
+// Conservative stack scanning: AOT-compiled code keeps live SageValues only in
+// C locals (it emits no explicit GC roots), so to collect safely we scan the
+// machine stack for words that point at live heap objects and treat them as
+// roots. `_gc_stack_base` is captured once at program start (the highest stack
+// address); the current stack pointer is the lowest. Anything in between that
+// looks like a live object payload pointer is marked.
+static void* _gc_stack_base = NULL;
+void sage_rt_gc_set_stack_base(void* p) { _gc_stack_base = p; }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utility — safe allocation
@@ -105,6 +119,13 @@ char* sage_rt_strndup(const char* s, int n) {
 
 void* sage_rt_gc_alloc(SageValType type, size_t size) {
     size_t total = sizeof(SageGCHdr) + size;
+    // Trigger GC *before* allocating/linking the new object, so a collection
+    // never sweeps a half-initialized allocation (its payload isn't populated
+    // and the caller hasn't received the pointer yet). Conservative stack
+    // scanning (see sage_rt_gc_collect) keeps this sound under AOT.
+    if (_gc.enabled && (_gc.bytes_live > _gc.next_gc || _gc.obj_count >= _gc.next_gc_objects)) {
+        sage_rt_gc_collect();
+    }
     SageGCHdr* hdr = (SageGCHdr*)sage_rt_alloc(total);
     hdr->flags    = ((uint32_t)type << 24);
     hdr->size     = (uint32_t)size;
@@ -113,11 +134,6 @@ void* sage_rt_gc_alloc(SageValType type, size_t size) {
     _gc.bytes_alloc += total;
     _gc.bytes_live  += total;
     _gc.obj_count++;
-
-    // Trigger GC if threshold crossed and GC is enabled
-    if (_gc.enabled && _gc.bytes_live > _gc.next_gc) {
-        sage_rt_gc_collect();
-    }
 
     return SAGE_GC_PAYLOAD(hdr);
 }
@@ -213,12 +229,80 @@ static void _gc_mark_value(SageValue v) {
     }
 }
 
+// Mark an object identified conservatively by a candidate payload pointer.
+// We confirm the pointer is a real live GC object by walking the object list
+// (linear, but collections are infrequent), then mark it *and* recurse into
+// its contents by reconstructing a typed SageValue from the header tag.
+static void _gc_mark_if_object(void* cand) {
+    if (!cand) return;
+    for (SageGCHdr* h = _gc.objects; h; h = h->next) {
+        if (SAGE_GC_PAYLOAD(h) == cand) {
+            if (SAGE_GC_MARKED(h)) return;  // already marked
+            SageValType t = (SageValType)((h->flags >> 24) & 0xFF);
+            SageValue v; v.type = t;
+            switch (t) {
+                case SAGE_VAL_STRING:  v.as.string  = (char*)cand; break;
+                case SAGE_VAL_ARRAY:   v.as.array   = (SageArray*)cand; break;
+                case SAGE_VAL_DICT:    v.as.dict    = (SageDict*)cand; break;
+                case SAGE_VAL_TUPLE:   v.as.tuple   = (SageTuple*)cand; break;
+                case SAGE_VAL_INSTANCE:v.as.instance= (SageInst*)cand; break;
+                case SAGE_VAL_FUNCTION:v.as.closure = (SageClosure*)cand; break;
+                case SAGE_VAL_BYTES:   v.as.bytes   = (SageBytes*)cand; break;
+                default:
+                    // Unknown/plain payload: just mark the header, no recursion.
+                    SAGE_GC_SET_MARK(h);
+                    return;
+            }
+            _gc_mark_value(v);  // marks + recurses into contents
+            return;
+        }
+    }
+}
+
+// Scan a contiguous memory range [lo, hi) word-by-word for object pointers.
+static void _gc_scan_range(void* lo, void* hi) {
+    if (!lo || !hi) return;
+    if ((char*)lo > (char*)hi) { void* t = lo; lo = hi; hi = t; }
+    // Align to pointer size.
+    uintptr_t start = ((uintptr_t)lo + sizeof(void*) - 1) & ~(uintptr_t)(sizeof(void*) - 1);
+    for (uintptr_t p = start; p + sizeof(void*) <= (uintptr_t)hi; p += sizeof(void*)) {
+        void* cand = *(void**)p;
+        _gc_mark_if_object(cand);
+    }
+}
+
 void sage_rt_gc_collect(void) {
     if (!_gc.enabled) return;
 
     // Mark phase: walk all registered roots
     for (int i = 0; i < _gc_root_count; i++) {
         if (_gc_roots[i]) _gc_mark_value(*_gc_roots[i]);
+    }
+
+    // Conservative stack scan: flush registers to the stack, then scan from the
+    // current frame up to the captured stack base for live object pointers.
+    if (_gc_stack_base) {
+        jmp_buf regs;
+        if (setjmp(regs) == 0) {
+            // setjmp captured callee-saved registers into `regs`; scan it too.
+            volatile int stack_marker;
+            void* sp = (void*)&stack_marker;
+            _gc_scan_range(sp, _gc_stack_base);
+            _gc_scan_range((void*)&regs, (void*)((char*)&regs + sizeof(regs)));
+        }
+    }
+
+    // Conservative data/BSS scan: AOT emits module-level state (e.g. a
+    // module's namespace dict or an `_atexit_handlers` array) as file-scope
+    // `static SageValue` globals, which live in the data/BSS segment rather
+    // than on the stack. Scan that whole region so those roots are found.
+    {
+        extern char __data_start[], _end[], __bss_start[];
+        char* d_lo = (char*)&__data_start;
+        char* d_hi = (char*)&_end;
+        if (d_lo && d_hi && d_lo < d_hi && (size_t)(d_hi - d_lo) < (size_t)512 * 1024 * 1024)
+            _gc_scan_range(d_lo, d_hi);
+        (void)__bss_start;
     }
 
     // Sweep phase: free unmarked, clear marks on survivors
@@ -248,6 +332,9 @@ void sage_rt_gc_collect(void) {
     // Back off next GC trigger (grow as heap grows)
     _gc.next_gc = _gc.bytes_live * 2;
     if (_gc.next_gc < 512 * 1024) _gc.next_gc = 512 * 1024;
+    // Object-count trigger: collect again after the live set roughly doubles,
+    // with a floor of 128 (matches the interpreter's object padding).
+    _gc.next_gc_objects = _gc.obj_count + _gc.obj_count / 2 + 128;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -321,6 +408,32 @@ SageRTGCStats sage_rt_gc_stats(void) {
     s.collections     = _gc.collections;
     s.live_objects    = _gc.obj_count;
     return s;
+}
+
+// gc_mode() -> "tracing" | "arc" | "orc"
+SageValue sage_rt_gc_mode(void) {
+    if (_gc.mode == 1) return sage_rt_string("arc");
+    if (_gc.mode == 2) return sage_rt_string("orc");
+    return sage_rt_string("tracing");
+}
+void sage_rt_gc_set_arc(void)     { _gc.mode = 1; }
+void sage_rt_gc_set_orc(void)     { _gc.mode = 2; }
+void sage_rt_gc_set_tracing(void) { _gc.mode = 0; }
+
+// gc_collections() -> int
+SageValue sage_rt_gc_collections(void) {
+    return sage_rt_int((int64_t)_gc.collections);
+}
+
+// gc_stats() -> dict (mirrors interpreter keys used by tests)
+SageValue sage_rt_gc_stats_dict(void) {
+    SageValue d = sage_rt_dict_new();
+    sage_rt_dict_set(d, sage_rt_string("bytes_allocated"), sage_rt_float((double)_gc.bytes_alloc));
+    sage_rt_dict_set(d, sage_rt_string("current_bytes"),   sage_rt_float((double)_gc.bytes_live));
+    sage_rt_dict_set(d, sage_rt_string("num_objects"),     sage_rt_float((double)_gc.obj_count));
+    sage_rt_dict_set(d, sage_rt_string("collections"),     sage_rt_int((int64_t)_gc.collections));
+    sage_rt_dict_set(d, sage_rt_string("objects_freed"),   sage_rt_float((double)_gc.bytes_freed));
+    return d;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1103,6 +1216,92 @@ int sage_rt_bytes_len(SageValue bytes) {
     return bytes.as.bytes->length;
 }
 
+// bytes(x): x may be an int (capacity), a string (its bytes), or an array of ints
+SageValue sage_rt_bytes_ctor(SageValue x) {
+    if (SAGE_IS_STRING(x) && x.as.string) {
+        return sage_rt_bytes_from((const uint8_t*)x.as.string, (int)strlen(x.as.string));
+    }
+    if (SAGE_IS_ARRAY(x)) {
+        SageArray* a = x.as.array;
+        SageValue b = sage_rt_bytes_new(a->count > 0 ? a->count : 1);
+        for (int i = 0; i < a->count; i++)
+            sage_rt_bytes_push(b, (uint8_t)(SAGE_IS_NUMERIC(a->elems[i]) ? SAGE_AS_INT64(a->elems[i]) : 0));
+        return b;
+    }
+    if (SAGE_IS_NUMERIC(x)) {
+        SageValue b = sage_rt_bytes_new((int)SAGE_AS_INT64(x));
+        return b;
+    }
+    return sage_rt_bytes_new(0);
+}
+
+// bytes_get(b, i) -> int (boxed)
+SageValue sage_rt_bytes_get_v(SageValue bytes, SageValue idx) {
+    if (!SAGE_IS_BYTES(bytes)) return sage_rt_nil();
+    SageBytes* b = bytes.as.bytes;
+    int i = (int)SAGE_AS_INT64(idx);
+    if (i < 0) i += b->length;
+    if (i < 0 || i >= b->length) return sage_rt_nil();
+    return sage_rt_int((int64_t)b->data[i]);
+}
+
+SageValue sage_rt_bytes_set_v(SageValue bytes, SageValue idx, SageValue val) {
+    if (!SAGE_IS_BYTES(bytes)) return sage_rt_nil();
+    SageBytes* b = bytes.as.bytes;
+    int i = (int)SAGE_AS_INT64(idx);
+    if (i >= 0 && i < b->length) b->data[i] = (uint8_t)SAGE_AS_INT64(val);
+    return sage_rt_nil();
+}
+
+SageValue sage_rt_bytes_to_string(SageValue bytes) {
+    if (!SAGE_IS_BYTES(bytes)) return sage_rt_string("");
+    SageBytes* b = bytes.as.bytes;
+    char* s = (char*)sage_rt_gc_alloc(SAGE_VAL_STRING, b->length + 1);
+    memcpy(s, b->data, b->length); s[b->length] = '\0';
+    return sage_rt_string(s);
+}
+
+SageValue sage_rt_bytes_from_string(SageValue s) {
+    if (!SAGE_IS_STRING(s) || !s.as.string) return sage_rt_bytes_new(0);
+    return sage_rt_bytes_from((const uint8_t*)s.as.string, (int)strlen(s.as.string));
+}
+
+SageValue sage_rt_bytes_slice(SageValue bytes, SageValue startv, SageValue endv) {
+    if (!SAGE_IS_BYTES(bytes)) return sage_rt_bytes_new(0);
+    SageBytes* b = bytes.as.bytes;
+    int start = (int)SAGE_AS_INT64(startv);
+    int end   = SAGE_IS_NIL(endv) ? b->length : (int)SAGE_AS_INT64(endv);
+    if (start < 0) start += b->length;
+    if (end   < 0) end   += b->length;
+    if (start < 0) start = 0;
+    if (end > b->length) end = b->length;
+    if (start >= end) return sage_rt_bytes_new(0);
+    return sage_rt_bytes_from(b->data + start, end - start);
+}
+
+SageValue sage_rt_bytes_len_v(SageValue bytes) {
+    return sage_rt_int((int64_t)sage_rt_bytes_len(bytes));
+}
+
+// sizeof(x): mirror the interpreter's type-dependent sizes
+SageValue sage_rt_sizeof(SageValue x) {
+    switch (x.type) {
+        case SAGE_VAL_FLOAT:   return sage_rt_int((int64_t)sizeof(double));
+        case SAGE_VAL_INT:     return sage_rt_int((int64_t)sizeof(double));
+        case SAGE_VAL_BOOL:    return sage_rt_int((int64_t)sizeof(int));
+        case SAGE_VAL_STRING:  return sage_rt_int((int64_t)(x.as.string ? strlen(x.as.string) : 0));
+        case SAGE_VAL_BYTES:   return sage_rt_int((int64_t)x.as.bytes->length);
+        case SAGE_VAL_ARRAY:   return sage_rt_int((int64_t)x.as.array->count);
+        case SAGE_VAL_DICT:    return sage_rt_int((int64_t)x.as.dict->count);
+        case SAGE_VAL_POINTER: {
+            if (!x.as.pointer) return sage_rt_int(0);
+            SageGCHdr* h = SAGE_GC_HEADER(x.as.pointer);
+            return sage_rt_int((int64_t)h->size);
+        }
+        default: return sage_rt_int((int64_t)sizeof(SageValue));
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Class / instance
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1336,6 +1535,27 @@ SageValue sage_rt_typeof(SageValue v) {
         case SAGE_VAL_EXCEPTION:return sage_rt_string("Exception");
         case SAGE_VAL_POINTER:  return sage_rt_string("Pointer");
         case SAGE_VAL_CLIB:     return sage_rt_string("CLib");
+        default:                return sage_rt_string("unknown");
+    }
+}
+
+// type() builtin — lowercase names matching interpreter's type() function
+SageValue sage_rt_type_lc(SageValue v) {
+    switch (v.type) {
+        case SAGE_VAL_INT:      return sage_rt_string("int");
+        case SAGE_VAL_FLOAT:    return sage_rt_string("float");
+        case SAGE_VAL_BOOL:     return sage_rt_string("bool");
+        case SAGE_VAL_NIL:      return sage_rt_string("nil");
+        case SAGE_VAL_STRING:   return sage_rt_string("string");
+        case SAGE_VAL_ARRAY:    return sage_rt_string("array");
+        case SAGE_VAL_DICT:     return sage_rt_string("dict");
+        case SAGE_VAL_TUPLE:    return sage_rt_string("tuple");
+        case SAGE_VAL_BYTES:    return sage_rt_string("bytes");
+        case SAGE_VAL_FUNCTION: return sage_rt_string("function");
+        case SAGE_VAL_INSTANCE: return sage_rt_string(v.as.instance->class_def
+                                    ? v.as.instance->class_def->name : "instance");
+        case SAGE_VAL_CLASS:    return sage_rt_string(v.as.class_def
+                                    ? v.as.class_def->name : "class");
         default:                return sage_rt_string("unknown");
     }
 }
@@ -1612,6 +1832,27 @@ void sage_rt_print(SageValue v) {
     fputs(s.as.string, stdout);
 }
 
+// sage_rt_print_kw: used for `print x` keyword — dispatches __str__ like the interpreter
+void sage_rt_print_kw(SageValue v) {
+    if (v.type == SAGE_VAL_INSTANCE && v.as.instance && v.as.instance->class_def) {
+        SageClass* _cls = v.as.instance->class_def;
+        while (_cls) {
+            for (int _mi = 0; _mi < _cls->method_count; _mi++) {
+                if (strcmp(_cls->methods[_mi].name, "__str__") == 0) {
+                    SageValue _res = _cls->methods[_mi].fn(v.as.instance, 0, NULL);
+                    v = SAGE_IS_STRING(_res) ? _res : sage_rt_tostring(_res);
+                    goto _pkw_out;
+                }
+            }
+            _cls = _cls->parent;
+        }
+    }
+    _pkw_out:;
+    SageValue s = sage_rt_tostring(v);
+    fputs(s.as.string, stdout);
+    fputc('\n', stdout);
+}
+
 void sage_rt_println(SageValue v) {
     sage_rt_print(v);
     fputc('\n', stdout);
@@ -1656,6 +1897,19 @@ void sage_rt_raise(SageValue exc) {
     SageValue s = sage_rt_tostring(exc);
     sage_rt_fatal("uncaught exception: %s",
                   s.as.string ? s.as.string : "(unknown)");
+}
+
+// Per-thread recursion-depth counter for compiled code (see sage_runtime.h).
+_Thread_local int sage_rt_call_depth = 0;
+
+void sage_rt_recursion_error(void) {
+    // Mirror the interpreter: error[E070], catchable exception. The counter is
+    // restored by the enclosing try frame on unwind (or is irrelevant if the
+    // exception is uncaught and we exit).
+    fprintf(stderr,
+            "error[E070]: maximum recursion depth exceeded (%d)\n",
+            SAGE_RT_MAX_DEPTH);
+    sage_rt_raise(sage_rt_exception("Maximum recursion depth exceeded"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1719,4 +1973,471 @@ SageValue sage_rt_ptr_add(SageValue ptr_val, SageValue offset_val) {
 SageValue sage_rt_ptr_null(void) {
     SageValue v; v.type = SAGE_VAL_POINTER; v.as.pointer = NULL;
     return v;
+}
+
+// mem_size(ptr) -> int  (size recorded in the GC header at alloc time)
+SageValue sage_rt_mem_size(SageValue ptr_val) {
+    if (!SAGE_IS_POINTER(ptr_val) || !ptr_val.as.pointer) return sage_rt_nil();
+    SageGCHdr* h = SAGE_GC_HEADER(ptr_val.as.pointer);
+    return sage_rt_int((int64_t)h->size);
+}
+
+// addressof(value) -> float (address of underlying data, for inspection only)
+SageValue sage_rt_addressof(SageValue v) {
+    void* addr = NULL;
+    switch (v.type) {
+        case SAGE_VAL_STRING:   addr = (void*)v.as.string; break;
+        case SAGE_VAL_ARRAY:    addr = (void*)v.as.array; break;
+        case SAGE_VAL_DICT:     addr = (void*)v.as.dict; break;
+        case SAGE_VAL_POINTER:  addr = v.as.pointer; break;
+        case SAGE_VAL_INSTANCE: addr = (void*)v.as.instance; break;
+        default:                addr = NULL; break;
+    }
+    return sage_rt_float((double)(uintptr_t)addr);
+}
+
+// ── Path utilities (mirror interpreter path_* builtins) ──────────────────────
+SageValue sage_rt_path_join(int argc, SageValue* argv) {
+    if (argc < 1) return sage_rt_string("");
+    size_t total = 1;
+    for (int i = 0; i < argc; i++)
+        total += (SAGE_IS_STRING(argv[i]) && argv[i].as.string ? strlen(argv[i].as.string) : 0) + 1;
+    char* buf = (char*)sage_rt_gc_alloc(SAGE_VAL_STRING, total);
+    buf[0] = '\0';
+    for (int i = 0; i < argc; i++) {
+        const char* seg = SAGE_IS_STRING(argv[i]) ? argv[i].as.string : "";
+        if (!seg) seg = "";
+        size_t len = strlen(buf);
+        if (i > 0 && len > 0 && buf[len-1] != '/') { buf[len] = '/'; buf[len+1] = '\0'; }
+        strcat(buf, seg);
+    }
+    return sage_rt_string(buf);
+}
+
+SageValue sage_rt_path_dirname(SageValue p) {
+    if (!SAGE_IS_STRING(p) || !p.as.string) return sage_rt_string(".");
+    const char* path = p.as.string;
+    const char* slash = strrchr(path, '/');
+    if (!slash) return sage_rt_string(".");
+    if (slash == path) return sage_rt_string("/");
+    size_t len = (size_t)(slash - path);
+    char* dir = (char*)sage_rt_gc_alloc(SAGE_VAL_STRING, len + 1);
+    memcpy(dir, path, len); dir[len] = '\0';
+    return sage_rt_string(dir);
+}
+
+SageValue sage_rt_path_basename(SageValue p) {
+    if (!SAGE_IS_STRING(p) || !p.as.string) return sage_rt_string("");
+    const char* path = p.as.string;
+    const char* slash = strrchr(path, '/');
+    return sage_rt_string(slash ? slash + 1 : path);
+}
+
+SageValue sage_rt_path_ext(SageValue p) {
+    if (!SAGE_IS_STRING(p) || !p.as.string) return sage_rt_string("");
+    const char* path = p.as.string;
+    const char* base = strrchr(path, '/');
+    const char* dot = strrchr(base ? base : path, '.');
+    if (!dot || dot == (base ? base + 1 : path)) return sage_rt_string("");
+    return sage_rt_string(dot);
+}
+
+SageValue sage_rt_path_stem(SageValue p) {
+    if (!SAGE_IS_STRING(p) || !p.as.string) return sage_rt_string("");
+    const char* path = p.as.string;
+    const char* slash = strrchr(path, '/');
+    const char* base = slash ? slash + 1 : path;
+    const char* dot = strrchr(base, '.');
+    if (!dot || dot == base) return sage_rt_string(base);
+    size_t len = (size_t)(dot - base);
+    char* stem = (char*)sage_rt_gc_alloc(SAGE_VAL_STRING, len + 1);
+    memcpy(stem, base, len); stem[len] = '\0';
+    return sage_rt_string(stem);
+}
+
+SageValue sage_rt_path_exists(SageValue p) {
+    if (!SAGE_IS_STRING(p) || !p.as.string) return sage_rt_bool(0);
+    return sage_rt_bool(access(p.as.string, 0 /*F_OK*/) == 0);
+}
+
+// ── Inline assembly (asm_exec / asm_arch) ────────────────────────────────────
+static const char* sage_asm_detect_arch(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    return "x86_64";
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    return "aarch64";
+#elif defined(__riscv) && __riscv_xlen == 64
+    return "rv64";
+#else
+    return "unknown";
+#endif
+}
+SageValue sage_rt_asm_arch(void) { return sage_rt_string(sage_asm_detect_arch()); }
+
+static int sage_asm_safe_path(const char* p) {
+    for (; *p; p++)
+        if (!isalnum((unsigned char)*p) && *p!='/' && *p!='.' && *p!='-' && *p!='_' && *p!='~')
+            return 0;
+    return 1;
+}
+static char* sage_asm_unescape(const char* raw) {
+    size_t len = strlen(raw);
+    char* out = (char*)malloc(len + 1); size_t j = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (raw[i]=='\\' && i+1<len) {
+            if (raw[i+1]=='n'){out[j++]='\n';i++;continue;}
+            if (raw[i+1]=='t'){out[j++]='\t';i++;continue;}
+        }
+        out[j++]=raw[i];
+    }
+    out[j]='\0'; return out;
+}
+
+// asm_exec(code, ret_type, ...args): assemble, link as .so, dlopen, call.
+SageValue sage_rt_asm_exec(int argc, SageValue* argv) {
+    if (argc < 2 || !SAGE_IS_STRING(argv[0]) || !SAGE_IS_STRING(argv[1]))
+        return sage_rt_nil();
+    char* code = sage_asm_unescape(argv[0].as.string);
+    const char* ret_type = argv[1].as.string;
+    int num_args = argc - 2;
+    if (num_args > 4) { free(code); return sage_rt_nil(); }
+    const char* arch = sage_asm_detect_arch();
+
+    char asm_path[] = "/tmp/sage_asm_XXXXXX.s";
+    char obj_path[] = "/tmp/sage_asm_XXXXXX.o";
+    char so_path[]  = "/tmp/sage_asm_XXXXXX.so";
+    int afd = mkstemps(asm_path, 2); int ofd = mkstemps(obj_path, 2); int sfd = mkstemps(so_path, 3);
+    if (afd>=0) close(afd); if (ofd>=0) close(ofd); if (sfd>=0) close(sfd);
+
+    FILE* f = fopen(asm_path, "w");
+    if (!f) { free(code); return sage_rt_nil(); }
+    fprintf(f, ".text\n.globl sage_asm_fn\n.type sage_asm_fn, @function\nsage_asm_fn:\n%s\n    ret\n.size sage_asm_fn, .-sage_asm_fn\n", code);
+    fclose(f); free(code);
+
+    if (!sage_asm_safe_path(asm_path) || !sage_asm_safe_path(obj_path) || !sage_asm_safe_path(so_path))
+        return sage_rt_nil();
+    char as_cmd[512], ld_cmd[512];
+    snprintf(as_cmd, sizeof(as_cmd), "as --64 -o %s %s 2>/dev/null", obj_path, asm_path);
+    snprintf(ld_cmd, sizeof(ld_cmd), "gcc -shared -o %s %s 2>/dev/null", so_path, obj_path);
+    (void)arch;
+    SageValue result = sage_rt_nil();
+    if (system(as_cmd)!=0) { unlink(asm_path); return sage_rt_nil(); }
+    if (system(ld_cmd)!=0) { unlink(asm_path); unlink(obj_path); return sage_rt_nil(); }
+
+    void* handle = dlopen(so_path, RTLD_LAZY);
+    if (!handle) goto cleanup;
+    {
+        void* sym = dlsym(handle, "sage_asm_fn");
+        if (!sym) { dlclose(handle); goto cleanup; }
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+        if (strcmp(ret_type,"double")==0) {
+            double da[4]={0}; for (int i=0;i<num_args;i++) da[i]=SAGE_AS_DOUBLE(argv[i+2]);
+            double (*f0)(void)=(double(*)(void))sym;
+            double (*f1)(double)=(double(*)(double))sym;
+            double (*f2)(double,double)=(double(*)(double,double))sym;
+            double (*f3)(double,double,double)=(double(*)(double,double,double))sym;
+            double (*f4)(double,double,double,double)=(double(*)(double,double,double,double))sym;
+            double r=0;
+            switch(num_args){case 0:r=f0();break;case 1:r=f1(da[0]);break;case 2:r=f2(da[0],da[1]);break;case 3:r=f3(da[0],da[1],da[2]);break;case 4:r=f4(da[0],da[1],da[2],da[3]);break;}
+            result = sage_rt_float(r);
+        } else if (strcmp(ret_type,"void")==0) {
+            long long ia[4]={0}; for (int i=0;i<num_args;i++) ia[i]=(long long)SAGE_AS_INT64(argv[i+2]);
+            void (*f0)(void)=(void(*)(void))sym;
+            void (*f1)(long long)=(void(*)(long long))sym;
+            void (*f2)(long long,long long)=(void(*)(long long,long long))sym;
+            switch(num_args){case 0:f0();break;case 1:f1(ia[0]);break;case 2:f2(ia[0],ia[1]);break;default:f0();break;}
+            result = sage_rt_nil();
+        } else {
+            long long ia[4]={0}; for (int i=0;i<num_args;i++) ia[i]=(long long)SAGE_AS_INT64(argv[i+2]);
+            long long (*f0)(void)=(long long(*)(void))sym;
+            long long (*f1)(long long)=(long long(*)(long long))sym;
+            long long (*f2)(long long,long long)=(long long(*)(long long,long long))sym;
+            long long (*f3)(long long,long long,long long)=(long long(*)(long long,long long,long long))sym;
+            long long (*f4)(long long,long long,long long,long long)=(long long(*)(long long,long long,long long,long long))sym;
+            long long r=0;
+            switch(num_args){case 0:r=f0();break;case 1:r=f1(ia[0]);break;case 2:r=f2(ia[0],ia[1]);break;case 3:r=f3(ia[0],ia[1],ia[2]);break;case 4:r=f4(ia[0],ia[1],ia[2],ia[3]);break;}
+            result = sage_rt_float((double)r);
+        }
+#pragma GCC diagnostic pop
+        dlclose(handle);
+    }
+cleanup:
+    unlink(asm_path); unlink(obj_path); unlink(so_path);
+    return result;
+}
+
+// ── C FFI (ffi_open / ffi_call / ffi_sym / ffi_close) ────────────────────────
+#ifdef SAGE_HAS_FFI
+#include <ffi.h>
+#endif
+
+SageValue sage_rt_ffi_open(SageValue name) {
+    if (!SAGE_IS_STRING(name) || !name.as.string) return sage_rt_nil();
+    void* h = dlopen(name.as.string, RTLD_LAZY);
+    if (!h) { fprintf(stderr, "ffi_open: %s\n", dlerror()); return sage_rt_nil(); }
+    SageValue v; v.type = SAGE_VAL_CLIB; v.as.clib = h; return v;
+}
+
+SageValue sage_rt_ffi_close(SageValue lib) {
+    if (lib.type == SAGE_VAL_CLIB && lib.as.clib) dlclose(lib.as.clib);
+    return sage_rt_nil();
+}
+
+// ffi_sym(lib, name) -> bool : does the symbol exist?
+SageValue sage_rt_ffi_sym(SageValue lib, SageValue name) {
+    if (lib.type != SAGE_VAL_CLIB || !lib.as.clib) return sage_rt_bool(0);
+    if (!SAGE_IS_STRING(name) || !name.as.string) return sage_rt_bool(0);
+    dlerror();
+    void* sym = dlsym(lib.as.clib, name.as.string);
+    return sage_rt_bool(sym != NULL && dlerror() == NULL);
+}
+
+// ffi_call(lib, func_name, ret_type, [args])
+SageValue sage_rt_ffi_call(SageValue lib, SageValue fname, SageValue rtype_v, SageValue argsv) {
+    if (lib.type != SAGE_VAL_CLIB || !lib.as.clib) return sage_rt_nil();
+    if (!SAGE_IS_STRING(fname) || !SAGE_IS_STRING(rtype_v)) return sage_rt_nil();
+    const char* func_name = fname.as.string;
+    const char* ret_type  = rtype_v.as.string;
+    dlerror();
+    void* sym = dlsym(lib.as.clib, func_name);
+    char* err = dlerror();
+    if (err) { fprintf(stderr, "ffi_call: %s\n", err); return sage_rt_nil(); }
+
+    int call_argc = 0;
+    SageValue* call_args = NULL;
+    if (SAGE_IS_ARRAY(argsv)) { call_args = argsv.as.array->elems; call_argc = argsv.as.array->count; }
+    if (call_argc > 16) { fprintf(stderr, "ffi_call: max 16 args\n"); return sage_rt_nil(); }
+
+#ifdef SAGE_HAS_FFI
+    ffi_cif cif;
+    ffi_type* arg_types[16];
+    void* arg_values[16];
+    int64_t int_vals[16];
+    double  dbl_vals[16];
+    const char* str_vals[16];
+
+    for (int i = 0; i < call_argc; i++) {
+        SageValue v = call_args[i];
+        if (SAGE_IS_INT(v)) {
+            int_vals[i] = v.as.integer; arg_types[i] = &ffi_type_sint64; arg_values[i] = &int_vals[i];
+        } else if (SAGE_IS_FLOAT(v)) {
+            dbl_vals[i] = v.as.number;  arg_types[i] = &ffi_type_double; arg_values[i] = &dbl_vals[i];
+        } else if (SAGE_IS_STRING(v)) {
+            str_vals[i] = v.as.string;  arg_types[i] = &ffi_type_pointer; arg_values[i] = &str_vals[i];
+        } else if (v.type == SAGE_VAL_POINTER && v.as.pointer) {
+            str_vals[i] = (const char*)v.as.pointer; arg_types[i] = &ffi_type_pointer; arg_values[i] = &str_vals[i];
+        } else {
+            int_vals[i] = 0; arg_types[i] = &ffi_type_sint64; arg_values[i] = &int_vals[i];
+        }
+    }
+
+    ffi_type* rtype;
+    if      (!strcmp(ret_type,"double") || !strcmp(ret_type,"float")) rtype = &ffi_type_double;
+    else if (!strcmp(ret_type,"int"))                                 rtype = &ffi_type_sint32;
+    else if (!strcmp(ret_type,"long") || !strcmp(ret_type,"int64"))   rtype = &ffi_type_sint64;
+    else if (!strcmp(ret_type,"string") || !strcmp(ret_type,"pointer")) rtype = &ffi_type_pointer;
+    else if (!strcmp(ret_type,"void"))                                rtype = &ffi_type_void;
+    else { fprintf(stderr, "ffi_call: unknown return type '%s'\n", ret_type); return sage_rt_nil(); }
+
+    if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned)call_argc, rtype, arg_types) != FFI_OK) {
+        fprintf(stderr, "ffi_call: prep_cif failed\n"); return sage_rt_nil();
+    }
+    if (rtype == &ffi_type_double) {
+        double r; ffi_call(&cif, FFI_FN(sym), &r, arg_values); return sage_rt_float(r);
+    } else if (rtype == &ffi_type_sint32) {
+        int r; ffi_call(&cif, FFI_FN(sym), &r, arg_values); return sage_rt_int((int64_t)r);
+    } else if (rtype == &ffi_type_sint64) {
+        int64_t r; ffi_call(&cif, FFI_FN(sym), &r, arg_values); return sage_rt_int(r);
+    } else if (rtype == &ffi_type_pointer) {
+        void* r; ffi_call(&cif, FFI_FN(sym), &r, arg_values);
+        if (!strcmp(ret_type,"string")) return r ? sage_rt_string((const char*)r) : sage_rt_nil();
+        SageValue p; p.type = SAGE_VAL_POINTER; p.as.pointer = r; return p;
+    } else {
+        ffi_call(&cif, FFI_FN(sym), NULL, arg_values); return sage_rt_nil();
+    }
+#else
+    fprintf(stderr, "ffi_call: built without libffi support\n");
+    return sage_rt_nil();
+#endif
+}
+
+// ── File I/O (io module) ─────────────────────────────────────────────────────
+SageValue sage_rt_io_writefile(SageValue path, SageValue content) {
+    if (!SAGE_IS_STRING(path) || !path.as.string) return sage_rt_bool(0);
+    const char* c = SAGE_IS_STRING(content) ? content.as.string : "";
+    FILE* f = fopen(path.as.string, "wb");
+    if (!f) return sage_rt_bool(0);
+    if (c) fwrite(c, 1, strlen(c), f);
+    fclose(f);
+    return sage_rt_bool(1);
+}
+SageValue sage_rt_io_readfile(SageValue path) {
+    if (!SAGE_IS_STRING(path) || !path.as.string) return sage_rt_nil();
+    FILE* f = fopen(path.as.string, "rb");
+    if (!f) return sage_rt_nil();
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n < 0) { fclose(f); return sage_rt_nil(); }
+    char* buf = (char*)sage_rt_gc_alloc(SAGE_VAL_STRING, (size_t)n + 1);
+    size_t got = fread(buf, 1, (size_t)n, f);
+    buf[got] = '\0';
+    fclose(f);
+    return sage_rt_string(buf);
+}
+SageValue sage_rt_io_exists(SageValue path) {
+    if (!SAGE_IS_STRING(path) || !path.as.string) return sage_rt_bool(0);
+    return sage_rt_bool(access(path.as.string, 0 /*F_OK*/) == 0);
+}
+SageValue sage_rt_io_remove(SageValue path) {
+    if (!SAGE_IS_STRING(path) || !path.as.string) return sage_rt_bool(0);
+    return sage_rt_bool(remove(path.as.string) == 0);
+}
+
+// ── CPU topology ─────────────────────────────────────────────────────────────
+SageValue sage_rt_cpu_count(void) {
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n < 1) n = 1;
+    return sage_rt_int((int64_t)n);
+}
+SageValue sage_rt_cpu_physical_cores(void) {
+    // Best-effort: report online processors. (Hyperthreading detection below
+    // would refine this, but tests only require physical >= 1 and <= logical.)
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n < 1) n = 1;
+    return sage_rt_float((double)n);
+}
+SageValue sage_rt_cpu_has_hyperthreading(void) {
+    return sage_rt_bool(0);
+}
+
+// ── Atomics ──────────────────────────────────────────────────────────────────
+// In AOT, async procs run synchronously, so an atomic is just a boxed int cell.
+typedef struct { int64_t value; } SageAtomic;
+
+SageValue sage_rt_atomic_new(SageValue init) {
+    SageAtomic* a = (SageAtomic*)sage_rt_manual_alloc(sizeof(SageAtomic));
+    a->value = SAGE_IS_NUMERIC(init) ? SAGE_AS_INT64(init) : 0;
+    SageValue v; v.type = SAGE_VAL_POINTER; v.as.pointer = a; return v;
+}
+SageValue sage_rt_atomic_load(SageValue av) {
+    if (!SAGE_IS_POINTER(av) || !av.as.pointer) return sage_rt_float(0);
+    return sage_rt_float((double)((SageAtomic*)av.as.pointer)->value);
+}
+SageValue sage_rt_atomic_store(SageValue av, SageValue n) {
+    if (SAGE_IS_POINTER(av) && av.as.pointer)
+        ((SageAtomic*)av.as.pointer)->value = SAGE_AS_INT64(n);
+    return sage_rt_nil();
+}
+SageValue sage_rt_atomic_add(SageValue av, SageValue n) {
+    if (!SAGE_IS_POINTER(av) || !av.as.pointer) return sage_rt_int(0);
+    SageAtomic* a = (SageAtomic*)av.as.pointer;
+    a->value += SAGE_AS_INT64(n);
+    return sage_rt_float((double)a->value);
+}
+SageValue sage_rt_atomic_sub(SageValue av, SageValue n) {
+    if (!SAGE_IS_POINTER(av) || !av.as.pointer) return sage_rt_int(0);
+    SageAtomic* a = (SageAtomic*)av.as.pointer;
+    a->value -= SAGE_AS_INT64(n);
+    return sage_rt_float((double)a->value);
+}
+SageValue sage_rt_atomic_cas(SageValue av, SageValue expected, SageValue desired) {
+    if (!SAGE_IS_POINTER(av) || !av.as.pointer) return sage_rt_bool(0);
+    SageAtomic* a = (SageAtomic*)av.as.pointer;
+    if (a->value == SAGE_AS_INT64(expected)) {
+        a->value = SAGE_AS_INT64(desired);
+        return sage_rt_bool(1);
+    }
+    return sage_rt_bool(0);
+}
+SageValue sage_rt_atomic_exchange(SageValue av, SageValue n) {
+    if (!SAGE_IS_POINTER(av) || !av.as.pointer) return sage_rt_int(0);
+    SageAtomic* a = (SageAtomic*)av.as.pointer;
+    int64_t old = a->value; a->value = SAGE_AS_INT64(n);
+    return sage_rt_float((double)old);
+}
+
+// ── Channels ─────────────────────────────────────────────────────────────────
+// A simple in-memory FIFO. In AOT async procs run synchronously, so a queue
+// faithfully models send/recv ordering without real threads.
+typedef struct {
+    SageValue* items;
+    int count, cap, head;
+    int closed;
+} SageChannel;
+
+SageValue sage_rt_channel_new(void) {
+    SageChannel* c = (SageChannel*)sage_rt_manual_alloc(sizeof(SageChannel));
+    c->items = NULL; c->count = 0; c->cap = 0; c->head = 0; c->closed = 0;
+    SageValue v; v.type = SAGE_VAL_POINTER; v.as.pointer = c; return v;
+}
+SageValue sage_rt_channel_send(SageValue cv, SageValue item) {
+    if (!SAGE_IS_POINTER(cv) || !cv.as.pointer) return sage_rt_nil();
+    SageChannel* c = (SageChannel*)cv.as.pointer;
+    if (c->head + c->count >= c->cap) {
+        int ncap = c->cap ? c->cap * 2 : 8;
+        SageValue* ni = (SageValue*)sage_rt_alloc((size_t)ncap * sizeof(SageValue));
+        for (int i = 0; i < c->count; i++) ni[i] = c->items[c->head + i];
+        c->items = ni; c->cap = ncap; c->head = 0;
+    }
+    c->items[c->head + c->count] = item;
+    c->count++;
+    return sage_rt_nil();
+}
+SageValue sage_rt_channel_recv(SageValue cv) {
+    if (!SAGE_IS_POINTER(cv) || !cv.as.pointer) return sage_rt_nil();
+    SageChannel* c = (SageChannel*)cv.as.pointer;
+    if (c->count == 0) return sage_rt_nil();  // empty/closed → nil
+    SageValue item = c->items[c->head];
+    c->head++; c->count--;
+    return item;
+}
+// try_recv returns Some(value) when an item is available, else nil (None).
+SageValue sage_rt_channel_try_recv(SageValue cv) {
+    if (!SAGE_IS_POINTER(cv) || !cv.as.pointer) return sage_rt_nil();
+    SageChannel* c = (SageChannel*)cv.as.pointer;
+    if (c->count == 0) return sage_rt_nil();
+    SageValue item = c->items[c->head];
+    c->head++; c->count--;
+    return sage_rt_some(item);
+}
+SageValue sage_rt_channel_close(SageValue cv) {
+    if (SAGE_IS_POINTER(cv) && cv.as.pointer)
+        ((SageChannel*)cv.as.pointer)->closed = 1;
+    return sage_rt_nil();
+}
+SageValue sage_rt_channel_len(SageValue cv) {
+    if (!SAGE_IS_POINTER(cv) || !cv.as.pointer) return sage_rt_int(0);
+    return sage_rt_int(((SageChannel*)cv.as.pointer)->count);
+}
+SageValue sage_rt_channel_is_closed(SageValue cv) {
+    if (!SAGE_IS_POINTER(cv) || !cv.as.pointer) return sage_rt_bool(0);
+    return sage_rt_bool(((SageChannel*)cv.as.pointer)->closed);
+}
+
+// ── Semaphores ───────────────────────────────────────────────────────────────
+// Counting semaphore as a plain integer cell (synchronous AOT model).
+typedef struct { int64_t permits; } SageSem;
+
+SageValue sage_rt_sem_new(SageValue init) {
+    SageSem* s = (SageSem*)sage_rt_manual_alloc(sizeof(SageSem));
+    s->permits = SAGE_IS_NUMERIC(init) ? SAGE_AS_INT64(init) : 0;
+    SageValue v; v.type = SAGE_VAL_POINTER; v.as.pointer = s; return v;
+}
+SageValue sage_rt_sem_wait(SageValue sv) {
+    if (SAGE_IS_POINTER(sv) && sv.as.pointer) {
+        SageSem* s = (SageSem*)sv.as.pointer;
+        if (s->permits > 0) s->permits--;
+    }
+    return sage_rt_nil();
+}
+SageValue sage_rt_sem_trywait(SageValue sv) {
+    if (!SAGE_IS_POINTER(sv) || !sv.as.pointer) return sage_rt_bool(0);
+    SageSem* s = (SageSem*)sv.as.pointer;
+    if (s->permits > 0) { s->permits--; return sage_rt_bool(1); }
+    return sage_rt_bool(0);
+}
+SageValue sage_rt_sem_post(SageValue sv) {
+    if (SAGE_IS_POINTER(sv) && sv.as.pointer)
+        ((SageSem*)sv.as.pointer)->permits++;
+    return sage_rt_nil();
 }

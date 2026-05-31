@@ -261,6 +261,18 @@ void sage_rt_coro_yield(SageCoroutine* co, SageValue val);
 // Forward declaration needed for sage_rt_add string path
 SageValue sage_rt_string_concat(SageValue a, SageValue b);
 
+// sage_rt_str_hash: FNV-1a hash for string values
+static inline uint64_t sage_rt_str_hash(SageValue v) {
+    if (!SAGE_IS_STRING(v) || !v.as.string) return 0;
+    const char* s = v.as.string;
+    uint64_t h = 14695981039346656037ULL;
+    while (*s) { h ^= (unsigned char)*s++; h *= 1099511628211ULL; }
+    return h;
+}
+
+// Forward declaration for operator overload dispatch
+SageValue sage_rt_method_call(SageValue obj, const char* method, int argc, SageValue* argv);
+
 static inline SageValue sage_rt_add(SageValue a, SageValue b) {
     if (SAGE_IS_INT(a) && SAGE_IS_INT(b))
         return sage_rt_int(a.as.integer + b.as.integer);
@@ -269,35 +281,48 @@ static inline SageValue sage_rt_add(SageValue a, SageValue b) {
     // String concatenation via generic add (for runtime dispatch)
     if (SAGE_IS_STRING(a) && SAGE_IS_STRING(b))
         return sage_rt_string_concat(a, b);
+    // Instance operator overload: __add__
+    if (a.type == SAGE_VAL_INSTANCE)
+        return sage_rt_method_call(a, "__add__", 1, (SageValue[]){b});
     return sage_rt_nil();
 }
 static inline SageValue sage_rt_sub(SageValue a, SageValue b) {
     if (SAGE_IS_INT(a) && SAGE_IS_INT(b))
         return sage_rt_int(a.as.integer - b.as.integer);
+    // Instance operator overload: __sub__
+    if (a.type == SAGE_VAL_INSTANCE)
+        return sage_rt_method_call(a, "__sub__", 1, (SageValue[]){b});
     return sage_rt_float(SAGE_AS_DOUBLE(a) - SAGE_AS_DOUBLE(b));
 }
+// Forward declaration for use in sage_rt_mul string repetition
+SageValue sage_rt_str_repeat(SageValue s, int64_t n);
+
 static inline SageValue sage_rt_mul(SageValue a, SageValue b) {
     if (SAGE_IS_INT(a) && SAGE_IS_INT(b))
         return sage_rt_int(a.as.integer * b.as.integer);
+    // string * int = string repetition
+    if (SAGE_IS_STRING(a) && SAGE_IS_INT(b)) return sage_rt_str_repeat(a, b.as.integer);
+    if (SAGE_IS_INT(a) && SAGE_IS_STRING(b)) return sage_rt_str_repeat(b, a.as.integer);
     return sage_rt_float(SAGE_AS_DOUBLE(a) * SAGE_AS_DOUBLE(b));
 }
 static inline SageValue sage_rt_div(SageValue a, SageValue b) {
-    // int / int = truncating integer division (Sage spec)
+    // int / int = truncating integer division (Sage spec).
+    // Division by zero evaluates to 0 (matches interpreter semantics).
     if (SAGE_IS_INT(a) && SAGE_IS_INT(b)) {
-        if (b.as.integer == 0) sage_rt_fatal("division by zero");
+        if (b.as.integer == 0) return sage_rt_int(0);
         return sage_rt_int(a.as.integer / b.as.integer);
     }
     double bd = SAGE_AS_DOUBLE(b);
-    if (bd == 0.0) sage_rt_fatal("division by zero");
+    if (bd == 0.0) return sage_rt_int(0);
     return sage_rt_float(SAGE_AS_DOUBLE(a) / bd);
 }
 static inline SageValue sage_rt_mod(SageValue a, SageValue b) {
     if (SAGE_IS_INT(a) && SAGE_IS_INT(b)) {
-        if (b.as.integer == 0) sage_rt_fatal("modulo by zero");
+        if (b.as.integer == 0) return sage_rt_int(0);
         return sage_rt_int(a.as.integer % b.as.integer);
     }
     double bd = SAGE_AS_DOUBLE(b);
-    if (bd == 0.0) sage_rt_fatal("modulo by zero");
+    if (bd == 0.0) return sage_rt_int(0);
     return sage_rt_float(fmod(SAGE_AS_DOUBLE(a), bd));
 }
 static inline SageValue sage_rt_pow(SageValue a, SageValue b) {
@@ -367,6 +392,7 @@ void* sage_rt_gc_alloc(SageValType type, size_t size);
 
 // Trigger a GC collection (can be called from user code via gc.collect()).
 void sage_rt_gc_collect(void);
+void sage_rt_gc_set_stack_base(void* p);
 
 // GC stats (for perf module)
 typedef struct {
@@ -376,6 +402,12 @@ typedef struct {
     int      live_objects;
 } SageRTGCStats;
 SageRTGCStats sage_rt_gc_stats(void);
+SageValue sage_rt_gc_mode(void);
+void sage_rt_gc_set_arc(void);
+void sage_rt_gc_set_orc(void);
+void sage_rt_gc_set_tracing(void);
+SageValue sage_rt_gc_collections(void);
+SageValue sage_rt_gc_stats_dict(void);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Memory modes
@@ -438,6 +470,19 @@ SageValue sage_rt_array_of(int count, ...);        // sage_rt_array_of(3, v1, v2
 void      sage_rt_array_push(SageValue arr, SageValue val);
 SageValue sage_rt_array_pop(SageValue arr);
 SageValue sage_rt_array_get(SageValue arr, SageValue idx);
+SageValue sage_rt_dict_get(SageValue dict, SageValue key);  /* fwd: used by sage_rt_index */
+// Universal indexer: dispatches to array_get or str_index based on runtime type
+static inline SageValue sage_rt_index(SageValue obj, SageValue idx) {
+    if (SAGE_IS_STRING(obj)) {
+        int64_t i = SAGE_AS_INT64(idx);
+        if (i < 0) i += (int64_t)strlen(obj.as.string);
+        if (i < 0 || i >= (int64_t)strlen(obj.as.string)) return sage_rt_nil();
+        char buf[2] = {obj.as.string[i], '\0'};
+        return sage_rt_string(buf);
+    }
+    if (SAGE_IS_DICT(obj)) return sage_rt_dict_get(obj, idx);
+    return sage_rt_array_get(obj, idx);
+}
 SageValue sage_rt_array_contains(SageValue arr, SageValue val);
 SageValue sage_rt_array_join(SageValue arr, SageValue sep);
 SageValue sage_rt_array_index_of(SageValue arr, SageValue val);
@@ -481,6 +526,14 @@ SageValue sage_rt_bytes_from(const uint8_t* data, int len);
 void      sage_rt_bytes_push(SageValue bytes, uint8_t byte);
 uint8_t   sage_rt_bytes_get(SageValue bytes, int idx);
 int       sage_rt_bytes_len(SageValue bytes);
+SageValue sage_rt_bytes_ctor(SageValue x);
+SageValue sage_rt_bytes_get_v(SageValue bytes, SageValue idx);
+SageValue sage_rt_bytes_set_v(SageValue bytes, SageValue idx, SageValue val);
+SageValue sage_rt_bytes_to_string(SageValue bytes);
+SageValue sage_rt_bytes_from_string(SageValue s);
+SageValue sage_rt_bytes_slice(SageValue bytes, SageValue startv, SageValue endv);
+SageValue sage_rt_bytes_len_v(SageValue bytes);
+SageValue sage_rt_sizeof(SageValue x);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Class / struct / instance
@@ -516,7 +569,8 @@ SageValue sage_rt_struct_copy(SageValue src);
 // ─────────────────────────────────────────────────────────────────────────────
 
 SageValue sage_rt_len(SageValue v);
-SageValue sage_rt_typeof(SageValue v);             // returns str
+SageValue sage_rt_typeof(SageValue v);             // returns str (capitalized: Array, Dict)
+SageValue sage_rt_type_lc(SageValue v);            // returns str (lowercase: array, dict)
 SageValue sage_rt_int_cast(SageValue v);
 SageValue sage_rt_float_cast(SageValue v);
 SageValue sage_rt_str_cast(SageValue v);
@@ -543,6 +597,7 @@ SageValue sage_rt_struct_size(SageValue def);
 // ─────────────────────────────────────────────────────────────────────────────
 
 void sage_rt_print(SageValue v);
+void sage_rt_print_kw(SageValue v);   // keyword print: dispatches __str__
 void sage_rt_println(SageValue v);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -564,11 +619,35 @@ typedef struct SageExcFrame {
     jmp_buf            jb;
     SageValue          exc;           // the caught value
     int                active;        // 1 = inside try block
+    int                saved_depth;   // sage_rt_call_depth at try entry (restored on unwind)
     struct SageExcFrame* prev;
 } SageExcFrame;
 
 // Per-thread exception frame stack
 extern _Thread_local SageExcFrame* sage_rt_exc_top;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Recursion-depth guard (compiled code)
+//
+// AOT-emitted procedures that participate in a recursive cycle increment a
+// per-thread depth counter on entry and decrement it on every exit (via a
+// scope-cleanup handler). When the counter exceeds SAGE_RT_MAX_DEPTH a
+// catchable "Maximum recursion depth exceeded" exception is raised, mirroring
+// the interpreter (error[E070], MAX_RECURSION_DEPTH=1000).
+//
+// Because the cleanup handler does NOT run when the stack is unwound by
+// longjmp (i.e. a raised exception), SAGE_TRY/SAGE_CATCH — and the equivalent
+// inline emission in aot.c — save and restore the counter across try frames.
+// ─────────────────────────────────────────────────────────────────────────────
+#ifndef SAGE_RT_MAX_DEPTH
+#define SAGE_RT_MAX_DEPTH 1000
+#endif
+extern _Thread_local int sage_rt_call_depth;
+// Raise the recursion-depth exception (never returns to the caller).
+void sage_rt_recursion_error(void) __attribute__((noreturn));
+// Scope-cleanup helper: decrement the depth counter when a guarded frame exits
+// normally. Used via __attribute__((cleanup(sage_rt_depth_pop))).
+static inline void sage_rt_depth_pop(int* _slot) { (void)_slot; sage_rt_call_depth--; }
 
 // Macros for compiled try/catch/finally
 //
@@ -581,6 +660,7 @@ extern _Thread_local SageExcFrame* sage_rt_exc_top;
     do { \
         (f).prev = sage_rt_exc_top; \
         (f).active = 1; \
+        (f).saved_depth = sage_rt_call_depth; \
         sage_rt_exc_top = &(f); \
         if (setjmp((f).jb) == 0)
 
@@ -588,6 +668,7 @@ extern _Thread_local SageExcFrame* sage_rt_exc_top;
         else { \
             (f).active = 0; \
             sage_rt_exc_top = (f).prev; \
+            sage_rt_call_depth = (f).saved_depth; \
             SageValue var = (f).exc;
 
 #define SAGE_FINALLY(f) \
@@ -614,6 +695,64 @@ void      sage_rt_mem_write(SageValue ptr_val, SageValue offset_val,
                             SageValue type_str, SageValue value);
 SageValue sage_rt_ptr_add(SageValue ptr_val, SageValue offset_val);
 SageValue sage_rt_ptr_null(void);
+SageValue sage_rt_mem_size(SageValue ptr_val);
+SageValue sage_rt_addressof(SageValue v);
+
+// Path utilities (match interpreter path_* builtins)
+SageValue sage_rt_path_join(int argc, SageValue* argv);
+SageValue sage_rt_path_dirname(SageValue p);
+SageValue sage_rt_path_basename(SageValue p);
+SageValue sage_rt_path_ext(SageValue p);
+SageValue sage_rt_path_stem(SageValue p);
+SageValue sage_rt_path_exists(SageValue p);
+
+// CPU topology
+SageValue sage_rt_cpu_count(void);
+SageValue sage_rt_cpu_physical_cores(void);
+SageValue sage_rt_cpu_has_hyperthreading(void);
+// File I/O (io module)
+SageValue sage_rt_io_writefile(SageValue path, SageValue content);
+SageValue sage_rt_io_readfile(SageValue path);
+SageValue sage_rt_io_exists(SageValue path);
+SageValue sage_rt_io_remove(SageValue path);
+// Inline assembly
+SageValue sage_rt_asm_exec(int argc, SageValue* argv);
+SageValue sage_rt_asm_arch(void);
+// C FFI
+SageValue sage_rt_ffi_open(SageValue name);
+SageValue sage_rt_ffi_close(SageValue lib);
+SageValue sage_rt_ffi_sym(SageValue lib, SageValue name);
+SageValue sage_rt_ffi_call(SageValue lib, SageValue fname, SageValue rtype_v, SageValue argsv);
+// Python FFI (defined in sage_py_rt.c)
+SageValue sage_rt_py_import(SageValue name);
+SageValue sage_rt_py_getattr(SageValue obj, SageValue name);
+SageValue sage_rt_py_call(SageValue obj, SageValue method, int argc, SageValue* argv);
+SageValue sage_rt_py_invoke(SageValue callable, int argc, SageValue* argv);
+SageValue sage_rt_py_eval(SageValue code);
+SageValue sage_rt_py_exec(SageValue code);
+SageValue sage_rt_py_method(SageValue obj, const char* name, int argc, SageValue* argv);
+int       sage_rt_py_is_obj(SageValue v);
+// Atomics
+SageValue sage_rt_atomic_new(SageValue init);
+SageValue sage_rt_atomic_load(SageValue av);
+SageValue sage_rt_atomic_store(SageValue av, SageValue n);
+SageValue sage_rt_atomic_add(SageValue av, SageValue n);
+SageValue sage_rt_atomic_sub(SageValue av, SageValue n);
+SageValue sage_rt_atomic_cas(SageValue av, SageValue expected, SageValue desired);
+SageValue sage_rt_atomic_exchange(SageValue av, SageValue n);
+// Channels
+SageValue sage_rt_channel_new(void);
+SageValue sage_rt_channel_send(SageValue cv, SageValue item);
+SageValue sage_rt_channel_recv(SageValue cv);
+SageValue sage_rt_channel_try_recv(SageValue cv);
+SageValue sage_rt_channel_close(SageValue cv);
+SageValue sage_rt_channel_len(SageValue cv);
+SageValue sage_rt_channel_is_closed(SageValue cv);
+// Semaphores
+SageValue sage_rt_sem_new(SageValue init);
+SageValue sage_rt_sem_wait(SageValue sv);
+SageValue sage_rt_sem_trywait(SageValue sv);
+SageValue sage_rt_sem_post(SageValue sv);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LilyBox hook points (no-ops when sandbox not active)
